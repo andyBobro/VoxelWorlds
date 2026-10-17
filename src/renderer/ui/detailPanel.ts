@@ -1,4 +1,7 @@
-import type { BBox, BuildingIndex, BuildingInfo, DetailParams, DetailStats } from '../../shared/contract';
+import type { BBox, BuildingIndex, BuildingInfo, DataSource, DetailParams, DetailRecord, DetailStats } from '../../shared/contract';
+import { detailRows, detailSizeNote, detailSummary, groupDetailsByBuilding } from '../lib/worlds';
+import { confirmBox } from './modal';
+import { toast } from './toast';
 import { clampWall, estimateDetailVoxels, wallSizeError } from '../detail/spec';
 import { BuildingGrid, edgeLength, pickFromHit } from '../pick/geometry';
 import { parseDecimal } from './controls';
@@ -16,6 +19,10 @@ export interface DetailContext {
   cityVwgPath: string;
   /** Buildings the generate reported (GenerateStats.buildingCount); the index only lists detailable ones. */
   buildingCount?: number;
+  /** OSM source of the shown city (generate's source, or WorldMeta.params.dataSource for an opened world); sent as ref.dataSource */
+  dataSource?: DataSource;
+  /** saved world of the shown city; sent as DetailParams.worldId so results are saved into it (absent when the world could not be saved) */
+  worldId?: string;
 }
 export const DETAIL_MAX_VOXELS_DEFAULT = 20_000_000;
 export const DETAIL_MAX_VOXELS_MIN = 1_000_000;
@@ -62,8 +69,20 @@ const DEFAULT_DETAIL_VOXEL = 0.15;
 export class DetailPanel {
   /** Fired when a detail/analyze job starts or ends (main uses it to block the sidebar Generate button). */
   onBusy: (busy: boolean) => void = () => {};
+  /** A detail was saved (record from detail()/openDetail) - main merges it into the session so lists and markers update at once. */
+  onRecord: (r: DetailRecord) => void = () => {};
+  /** Delete a saved record (main owns the confirm-free API call + session update). */
+  deleteRecord: (r: DetailRecord) => Promise<void> = async () => {};
+  /** Non-empty = Generate detail is disabled with this reason (e.g. the saved world's Geofabrik extract is gone). Re-evaluated on `refreshBlock()`. */
+  sourceBlock: () => string = () => '';
+  /** Non-blocking amber note (e.g. the local extract changed since the world was generated). */
+  sourceNote: () => string = () => '';
 
   private grid: BuildingGrid | null = null;
+  private byId = new Map<string, BuildingInfo>();
+  private saved = new Map<string, DetailRecord[]>();
+  private detailBuildingId: string | null = null;
+  private viewedRecordId: string | null = null;
   private ctx: DetailContext | null = null;
   private building: BuildingInfo | null = null;
   private edge = -1;
@@ -97,6 +116,7 @@ export class DetailPanel {
   };
   private readonly count = h('div', { class: 'muted bp-count' });
   private readonly detailBtn = h('button', { class: 'primary', text: 'Detail this building', disabled: true });
+  private readonly savedBox = h('div', { class: 'bp-saved', id: 'bp-saved', hidden: true });
   // detail form
   private readonly form = h('div');
   private readonly choose = h('button', { text: 'Choose photo...' });
@@ -118,6 +138,9 @@ export class DetailPanel {
   private readonly seed = num(1, 'Seed');
   private readonly voxel = num(DEFAULT_DETAIL_VOXEL, 'Detail voxel size in metres');
   private readonly maxVox = num(DETAIL_MAX_VOXELS_DEFAULT / 1e6, 'Detail max voxels in millions');
+  private readonly srcNote = h('div', { class: 'warn', id: 'bp-src-note', hidden: true });
+  private readonly staleNote = h('div', { class: 'warn', id: 'bp-stale-note', hidden: true });
+  private readonly sizeNote = h('div', { class: 'warn', id: 'bp-size-note', hidden: true });
   private readonly estimate = h('div', { class: 'muted' });
   private readonly warn = h('div', { class: 'warn err', hidden: true });
   private readonly memHint = h('div', { class: 'warn', hidden: true });
@@ -150,6 +173,7 @@ export class DetailPanel {
     this.sBuilding = sec(
       kvRow('ID', this.kv.id), kvRow('Kind', this.kv.kind), kvRow('Name', this.kv.name),
       kvRow('Levels', this.kv.levels), kvRow('Height', this.kv.height), this.count,
+      this.savedBox,
       h('div', { class: 'row buttons' }, this.detailBtn),
     );
 
@@ -175,7 +199,7 @@ export class DetailPanel {
       photoSec, interiorSec,
       h('div', { class: 'bp-gen' },
         h('div', { class: 'row' }, field('Voxel size (m)', this.voxel), field('Max voxels (M)', this.maxVox)),
-        this.estimate, this.memHint, this.warn, h('div', { class: 'row buttons' }, this.generate), this.status),
+        this.srcNote, this.staleNote, this.estimate, this.sizeNote, this.memHint, this.warn, h('div', { class: 'row buttons' }, this.generate), this.status),
     );
     this.sDetail = sec(h('h2', { text: 'Detail' }), this.form);
     this.sView = sec(
@@ -254,6 +278,7 @@ export class DetailPanel {
     this.clear();
     this.ctx = ctx;
     this.grid = new BuildingGrid(index.buildings);
+    this.byId = new Map(index.buildings.map((b) => [b.id, b]));
     this.root.hidden = false;
     this.root.parentElement?.classList.add('has-panel');
     this.renderInfo();
@@ -267,6 +292,8 @@ export class DetailPanel {
     }
     this.lastStats = null;
     this.detailPath = null;
+    this.detailBuildingId = null;
+    this.viewedRecordId = null;
     this.building = null;
     this.edge = -1;
     this.formOpen = false;
@@ -280,6 +307,7 @@ export class DetailPanel {
   clear(): void {
     this.resetAll();
     this.grid = null;
+    this.byId = new Map();
     this.ctx = null;
     this.busy = false;
     this.root.hidden = true;
@@ -293,6 +321,7 @@ export class DetailPanel {
     this.syncQuad();
     this.updateEstimate();
     this.detailBtn.disabled = !this.building || this.busy || this.locked;
+    this.renderSaved();
   }
 
   dispose(): void {
@@ -376,6 +405,7 @@ export class DetailPanel {
     this.updateEstimate();
     this.choose.disabled = this.blocked;
     this.detailBtn.disabled = !this.building || this.blocked;
+    this.renderSaved();
   }
 
   // ---- picking / selection
@@ -403,6 +433,7 @@ export class DetailPanel {
     this.renderInfo();
     this.syncWallFields();
     this.updateEstimate();
+    this.renderSaved();
   }
 
   /**
@@ -469,6 +500,104 @@ export class DetailPanel {
     this.edgeRow.hidden = this.inDetail || !b;
     if (b) this.edgeLabel.textContent = `Wall ${this.edge + 1}/${b.footprint.length} - ${this.edgeM().toFixed(1)} m`;
     this.detailBtn.disabled = !b || this.blocked;
+    this.renderSaved();
+  }
+
+  // ---- saved details
+
+  /** Records of the current world (any building); the picked building's own are listed in the panel. */
+  setSavedDetails(records: readonly DetailRecord[]): void {
+    this.saved = groupDetailsByBuilding(records);
+    this.renderSaved();
+  }
+
+  hasBuilding(id: string): boolean { return this.byId.has(id); }
+
+  /** The data-source availability changed (extract downloaded / deleted): re-evaluate the Generate detail gate. */
+  refreshBlock(): void { this.updateEstimate(); }
+
+  /**
+   * A saved record was deleted. If its scene is on screen, close it (its .vwg may be gone, so export could fail)
+   * and tell the user. Returns true when a scene was closed.
+   */
+  /** Leave the detail scene (if any) and return to the city. */
+  closeScene(): void { if (this.inDetail) this.backToCity(); }
+
+  recordDeleted(r: DetailRecord): boolean {
+    if (!this.inDetail || this.viewedRecordId !== r.id) return false;
+    this.backToCity();
+    toast('The saved detail you were viewing was deleted; its scene was closed.', 'warn', 5000);
+    return true;
+  }
+
+  private renderSaved(): void {
+    const b = this.building;
+    const recs = b ? this.saved.get(b.id) ?? [] : [];
+    this.savedBox.hidden = recs.length === 0;
+    this.savedBox.replaceChildren();
+    if (!recs.length) return;
+    this.savedBox.append(h('div', { class: 'bp-saved-h', text: `Saved details (${recs.length})` }));
+    for (const r of detailRows(recs)) {
+      const rec = recs.find((x) => x.id === r.id)!;
+      const open = h('button', { text: 'Open', class: 'primary', type: 'button', disabled: this.blocked });
+      const del = h('button', { text: 'Delete', class: 'danger', type: 'button', disabled: this.blocked });
+      if (this.blocked) { open.title = del.title = 'Wait for the running job to finish'; }
+      open.addEventListener('click', () => void this.openSaved(rec, false));
+      del.addEventListener('click', () => void this.confirmDelete(rec));
+      const item = h('div', { class: 'bp-saved-item' },
+        h('div', { class: 'bp-saved-main' }, h('b', { text: r.date }), h('div', { class: 'muted', text: detailSummary(r) })),
+        h('div', { class: 'row' }, open, del));
+      item.dataset.detail = r.id;
+      this.savedBox.append(item);
+    }
+  }
+
+  private async confirmDelete(rec: DetailRecord): Promise<void> {
+    const r = detailRows([rec])[0]!;
+    const ok = await confirmBox({
+      title: 'Delete saved detail?', message: `${r.date}, ${r.voxelSize}, interior ${r.interior} (${r.size}) will be removed from disk.`,
+      okLabel: 'Delete', danger: true,
+    });
+    if (!ok) return;
+    try {
+      await this.deleteRecord(rec);
+      toast('Detail deleted');
+    } catch (e) {
+      this.status.textContent = `Delete failed: ${errorText(e)}`;
+    }
+  }
+
+  /**
+   * Opens a saved detail instantly (no backend job): selects/flies to its building when it is in the city index
+   * (`focus`), then shows the stored scene exactly like a fresh result (cutaway slider, export of the returned vwgPath).
+   */
+  async openSaved(rec: DetailRecord, focus: boolean, standalone = false): Promise<void> {
+    if (this.blocked) return;
+    if (this.inDetail) this.backToCity(); // restore the city camera before the scene is swapped again
+    // Standalone: the record belongs to another world than the city on screen. Its building is not in this index,
+    // so nothing is selected or focused; "Back to city" returns to the city that was shown before.
+    const b = standalone ? null : this.byId.get(rec.buildingId) ?? null;
+    if (b) {
+      this.select(b, this.edge >= 0 && this.building?.id === b.id ? this.edge : 0);
+      if (focus) this.preview.focusBuilding(b);
+    }
+    this.startJob('Opening saved detail...');
+    let final = '';
+    try {
+      const res = await window.voxel.openDetail(rec.worldId, rec.id);
+      const buf = await window.voxel.readVwg(res.vwgPath);
+      this.preview.showDetail(buf);
+      this.detailPath = res.vwgPath;
+      this.detailBuildingId = rec.buildingId;
+      this.viewedRecordId = rec.id;
+      this.enterDetailView(rec.buildingId, res.stats);
+      this.log(`Opened saved detail ${rec.buildingId} (${res.stats.voxelCount.toLocaleString()} voxels)`);
+    } catch (e) {
+      final = this.explain(e);
+      this.log(`Open detail failed: ${errorText(e)}`, 'err');
+    } finally {
+      this.endJob(final);
+    }
   }
 
   // ---- photo
@@ -583,13 +712,24 @@ export class DetailPanel {
     this.memHint.textContent = mem ?? '';
     this.maxVox.classList.toggle('invalid', !!b && mv === null);
     this.voxel.classList.toggle('invalid', !!b && !ok);
-    this.generate.disabled = !ok || this.blocked || (!!this.facade.spec && this.wallError() !== null);
+    const stale = this.ctx ? this.sourceNote() : '';
+    this.staleNote.hidden = !stale;
+    this.staleNote.textContent = stale;
+    const srcReason = this.ctx ? this.sourceBlock() : '';
+    this.srcNote.hidden = !srcReason;
+    this.srcNote.textContent = srcReason;
+    this.generate.title = srcReason;
+    this.generate.disabled = !ok || this.blocked || !!srcReason || (!!this.facade.spec && this.wallError() !== null);
     if (!b || !ok || !v || !this.ctx || mv === null) {
       this.estimate.textContent = !b ? '' : mv === null ? `Max voxels must be ${DETAIL_MAX_VOXELS_MIN / 1e6} - ${DETAIL_MAX_VOXELS_MAX / 1e6} M.` : 'Voxel size must be 0.05 - 0.5 m.';
       this.warn.hidden = true;
+      this.sizeNote.hidden = true;
       return;
     }
     const n = estimateDetailVoxels(b, this.preview.voxelSize, v, this.interiorOptions());
+    const sn = detailSizeNote(n);
+    this.sizeNote.hidden = !sn;
+    this.sizeNote.textContent = sn ?? '';
     const over = n > mv;
     this.estimate.textContent = over
       ? `Estimated ~${n.toLocaleString()} voxels - over the limit`
@@ -612,7 +752,11 @@ export class DetailPanel {
     if (this.facade.spec && this.wallError()) return;
     const spec = this.useFacade.checked && !this.specStale ? this.facade.getSpec() : null;
     const params: DetailParams = {
-      ref: { bbox: ctx.bbox, buildingId: b.id, metersPerFloor: ctx.metersPerFloor, defaultBuildingHeight: ctx.defaultBuildingHeight },
+      ref: {
+        bbox: ctx.bbox, buildingId: b.id, metersPerFloor: ctx.metersPerFloor, defaultBuildingHeight: ctx.defaultBuildingHeight,
+        ...(ctx.dataSource ? { dataSource: ctx.dataSource } : {}),
+      },
+      ...(ctx.worldId ? { worldId: ctx.worldId } : {}),
       voxelSize: v,
       facade: spec && this.edge >= 0 ? { edge: this.edge, spec } : undefined,
       interior: this.interiorOptions(),
@@ -625,7 +769,10 @@ export class DetailPanel {
       const buf = await window.voxel.readVwg(res.vwgPath);
       this.preview.showDetail(buf);
       this.detailPath = res.vwgPath;
-      this.enterDetailView(b, res.stats);
+      this.detailBuildingId = b.id;
+      this.viewedRecordId = res.record?.id ?? null;
+      this.enterDetailView(b.id, res.stats);
+      if (res.record) { this.onRecord(res.record); toast('Detail saved to the world'); }
       this.log(`Detail ${b.id}: ${res.stats.voxelCount.toLocaleString()} voxels in ${(res.stats.elapsedMs / 1000).toFixed(1)} s`);
     } catch (e) {
       final = this.explain(e);
@@ -635,11 +782,11 @@ export class DetailPanel {
     }
   }
 
-  private enterDetailView(b: BuildingInfo, s: DetailStats): void {
+  private enterDetailView(buildingId: string, s: DetailStats): void {
     this.lastStats = s;
     this.showMode('detail');
     this.viewStats.textContent =
-      `${b.id}: ${s.voxelCount.toLocaleString()} voxels, ${s.levels} levels, ${s.rooms} rooms, ${s.windows} windows, ${s.doors} doors`;
+      `${buildingId}: ${s.voxelCount.toLocaleString()} voxels, ${s.levels} levels, ${s.rooms} rooms, ${s.windows} windows, ${s.doors} doors`;
     const n = s.floorYs.length;
     this.sliderField.hidden = n === 0;
     this.slider.max = String(n);
@@ -665,6 +812,8 @@ export class DetailPanel {
     this.preview.setCutaway(null);
     this.lastStats = null;
     this.detailPath = null;
+    this.detailBuildingId = null;
+    this.viewedRecordId = null;
     this.wallNote.hidden = true;
     this.photoErr.hidden = true;
     this.status.textContent = '';
@@ -675,7 +824,7 @@ export class DetailPanel {
 
   /** What sidebar export should write: the detail scene while viewing it, else the city. */
   activeExport(): { vwgPath: string; suffix: string } | null {
-    if (this.inDetail && this.detailPath) return { vwgPath: this.detailPath, suffix: (this.building?.id ?? 'detail').replace(/[^\w.-]+/g, '_') };
+    if (this.inDetail && this.detailPath) return { vwgPath: this.detailPath, suffix: (this.detailBuildingId ?? this.building?.id ?? 'detail').replace(/[^\w.-]+/g, '_') };
     return this.ctx ? { vwgPath: this.ctx.cityVwgPath, suffix: '' } : null;
   }
 }

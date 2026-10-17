@@ -8,8 +8,9 @@ export class MapView {
   private map: L.Map;
   private drawn = new L.FeatureGroup();
   private bbox: BBox | null = null;
+  private pendingFit: BBox | null = null;
 
-  constructor(el: HTMLElement, private onChange: (bbox: BBox | null) => void) {
+  constructor(private readonly el: HTMLElement, private onChange: (bbox: BBox | null) => void) {
     this.map = L.map(el, { zoomControl: true }).setView([48.8566, 2.3522], 13);
     L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
       maxZoom: 19,
@@ -63,6 +64,15 @@ export class MapView {
     this.onChange(this.bbox);
   }
 
+  /** Draw/replace the rectangle (e.g. from a saved world's params) and zoom to it once the map is visible. */
+  setBBox(b: BBox): void {
+    this.drawn.clearLayers();
+    this.drawn.addLayer(L.rectangle([[b.latMin, b.lonMin], [b.latMax, b.lonMax]], { color: '#ff1744', weight: 3, opacity: 1, fillColor: '#ff1744', fillOpacity: 0.15 }));
+    this.pendingFit = b;
+    if (this.el.offsetParent !== null) this.refresh();
+    this.update();
+  }
+
   getBBox(): BBox | null {
     return this.bbox;
   }
@@ -70,5 +80,10 @@ export class MapView {
   /** Call when the map tab becomes visible. */
   refresh(): void {
     this.map.invalidateSize();
+    const b = this.pendingFit;
+    if (b) {
+      this.pendingFit = null;
+      this.map.fitBounds([[b.latMin, b.lonMin], [b.latMax, b.lonMax]], { maxZoom: 18, animate: false });
+    }
   }
 }

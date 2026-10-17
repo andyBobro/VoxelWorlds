@@ -1,4 +1,4 @@
-import type { AnalyzeFacadeParams, BBox, BuildingIndex, DetailParams, DetailStats, FacadeSpec, GenerateParams } from '../shared/contract';
+import type { AnalyzeFacadeParams, BBox, BuildingIndex, DataSource, DetailParams, DetailStats, FacadeSpec, GenerateParams } from '../shared/contract';
 
 /** Pure parameter validation (no electron imports so it is unit-testable). All errors are BAD_REQUEST. */
 
@@ -17,13 +17,39 @@ export function validateBBox(b: BBox | undefined): void {
   if (b!.latMin >= b!.latMax || b!.lonMin >= b!.lonMax) bad('empty bbox');
 }
 
+/** Geofabrik ids: lower-case segments joined by '/', e.g. "monaco", "us/alabama". No '..', no leading dots. */
+const REGION_ID_RE = /^[a-z0-9][a-z0-9_.-]{0,63}(\/[a-z0-9][a-z0-9_.-]{0,63}){0,3}$/;
+export const isRegionId = (id: unknown): id is string => typeof id === 'string' && id.length <= 200 && REGION_ID_RE.test(id);
+
+/** Shape check of a renderer-supplied DataSource (missing = overpass). Any pbfPath it carries is ignored/overwritten by main. */
+export function validateDataSource(ds: unknown): void {
+  if (ds === undefined || ds === null) return;
+  const d = ds as DataSource;
+  if (typeof d !== 'object') bad('invalid dataSource');
+  if (d.kind === 'overpass') return;
+  if (d.kind !== 'pbf') bad('unknown dataSource kind');
+  if (!isRegionId((d as { regionId?: unknown }).regionId)) bad('invalid dataSource.regionId');
+}
+
+/** Identity of a data source for the "detail must match last generate" rule (pbfPath is irrelevant). */
+export const sourceKey = (ds: DataSource | undefined | null): string => (ds && ds.kind === 'pbf' ? `pbf:${ds.regionId}` : 'overpass');
+
 export function validateGenerate(p: GenerateParams): void {
-  validateBBox(p?.bbox);
+  if (!p || typeof p !== 'object') bad('missing params');
+  validateBBox(p.bbox);
+  validateDataSource(p.dataSource);
   if (!(p.voxelSize >= 0.05 && p.voxelSize <= 5)) bad('voxelSize out of range');
   if (p.tileSize !== undefined && !(p.tileSize >= 50 && p.tileSize <= 5000)) bad('tileSize out of range');
   if (p.workers !== undefined && !(Number.isInteger(p.workers) && p.workers >= 0 && p.workers <= 16)) {
     bad('workers out of range');
   }
+  const f = p.features as unknown as Record<string, unknown> | undefined;
+  if (!f || typeof f !== 'object') bad('features missing');
+  for (const k of ['roads', 'elevation', 'proceduralFacades']) if (typeof f![k] !== 'boolean') bad(`features.${k} must be a boolean`);
+  if (!rng(p.metersPerFloor, 0.5, 10)) bad('metersPerFloor out of range (0.5-10)');
+  if (!rng(p.defaultBuildingHeight, 1, 1000)) bad('defaultBuildingHeight out of range (1-1000)');
+  if (!int(p.maxVoxels, 1, 2_000_000_000)) bad('maxVoxels out of range');
+  if (p.mapillaryToken !== undefined && (typeof p.mapillaryToken !== 'string' || p.mapillaryToken.length > 512)) bad('invalid mapillaryToken');
 }
 
 export function validateAnalyzeFacade(p: AnalyzeFacadeParams): void {
@@ -84,11 +110,22 @@ export function validateDetailStats(s: DetailStats): void {
 const sameBBox = (a: BBox, b: BBox): boolean =>
   (['latMin', 'lonMin', 'latMax', 'lonMax'] as const).every((k) => Math.abs(a[k] - b[k]) <= 1e-9);
 
-/** `lastBBox` = bbox of the last generate in this session; detail must reference it. */
-export function validateDetail(p: DetailParams, lastBBox: BBox | null): void {
+export interface LastGenerate {
+  bbox: BBox;
+  dataSource?: DataSource;
+}
+
+/**
+ * `last` = the last generate (or opened world): detail must reference the same bbox AND the same data source
+ * (kind + regionId). A bare BBox means "overpass" (legacy callers/tests).
+ */
+export function validateDetail(p: DetailParams, last: BBox | LastGenerate | null): void {
   if (!p || typeof p !== 'object') bad('missing params');
   validateBBox(p.ref?.bbox);
-  if (!lastBBox || !sameBBox(p.ref.bbox, lastBBox)) bad('ref.bbox does not match the last generated area');
+  const lg: LastGenerate | null = last && 'bbox' in last ? last : last ? { bbox: last } : null;
+  if (!lg || !sameBBox(p.ref.bbox, lg.bbox)) bad('ref.bbox does not match the last generated area');
+  validateDataSource(p.ref.dataSource);
+  if (sourceKey(p.ref.dataSource) !== sourceKey(lg!.dataSource)) bad('ref.dataSource does not match the last generated area');
   if (typeof p.ref.buildingId !== 'string' || !/^(way|relation|node)\/\d+(#\d+)?$/.test(p.ref.buildingId)) {
     bad('invalid buildingId');
   }

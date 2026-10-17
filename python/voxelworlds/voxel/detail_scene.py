@@ -226,14 +226,31 @@ def run_detail(job: Job, p: dict, cfg: Config = DEFAULT_CONFIG) -> None:
     q = _validate(p)
     bbox, bid, vs, max_vox = q["bbox"], q["bid"], q["vs"], q["max_vox"]
 
-    # ---- OSM (cache hit for the bbox used by generate)
+    # ---- OSM (cache hit for the bbox used by generate; a pbf source can also rebuild it from the local file)
+    from ..osm import pbf as pbfmod
+    src = pbfmod.resolve_source((p.get("ref") or {}).get("dataSource"), missing_code="NO_DATA")
     job.progress("osm", 0, "Loading building data")
-    want_roads = osmfetch.cached_roads_variant(bbox, cfg)
-    if not want_roads and not osmfetch.cached_any(bbox, cfg):
-        # never go to Overpass from a detail request (retry loops of minutes): the generate run's cache is the source
-        raise PipelineError("NO_DATA", "OSM cache for this area is missing or expired: generate the scene again")
-    gdf = job.run_blocking(lambda: osmfetch.fetch_features(bbox, want_roads, cfg, job.cancel_event),
-                           "Loading building data", poll=0.02)
+    want_roads = osmfetch.cached_roads_variant(bbox, cfg, src) if src else osmfetch.cached_roads_variant(bbox, cfg)
+    stale = False
+    if not want_roads and not (osmfetch.cached_any(bbox, cfg, src) if src else osmfetch.cached_any(bbox, cfg)):
+        if src is not None or not osmfetch.cached_any(bbox, cfg, allow_stale=True):
+            # never go to Overpass from a detail request (retry loops of minutes): the generate run's cache is the source
+            raise PipelineError("NO_DATA", "OSM cache for this area is missing or expired: generate the scene again")
+        # detail (only) may use an expired but present cache of the exact bbox instead of failing
+        stale = True
+        want_roads = osmfetch.cached_roads_variant(bbox, cfg, allow_stale=True)
+        ts = osmfetch.oldest_cached(bbox, cfg)
+        day = time.strftime("%Y-%m-%d", time.localtime(ts)) if ts else "an earlier session"
+        job.warning("OSM_CACHE_STALE", f"Using saved OSM data from {day} for this world.")
+    if src is None:
+        kw = {"allow_stale": True} if stale else {}
+        gdf = job.run_blocking(lambda: osmfetch.fetch_features(bbox, want_roads, cfg, job.cancel_event, **kw),
+                               "Loading building data", poll=0.02)
+    else:
+        gdf = job.run_blocking(
+            lambda: osmfetch.fetch_features(bbox, want_roads, cfg, job.cancel_event, source=src,
+                                            on_pbf=lambda f, m: job.progress("pbf", f * 100.0, m)),
+            "Loading building data", poll=0.02, unwind=1.0)
     if not len(gdf):
         raise PipelineError("BUILDING_NOT_FOUND", "No OSM data in the bbox")
     clat, clon = (bbox["latMin"] + bbox["latMax"]) / 2.0, (bbox["lonMin"] + bbox["lonMax"]) / 2.0

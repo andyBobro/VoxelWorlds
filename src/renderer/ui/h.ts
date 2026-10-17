@@ -1,4 +1,4 @@
-type Attrs = { class?: string; text?: string; title?: string; type?: string; value?: string; min?: string; max?: string; step?: string; placeholder?: string; disabled?: boolean; checked?: boolean; hidden?: boolean; id?: string; style?: string; open?: boolean };
+type Attrs = { class?: string; role?: string; for?: string; text?: string; title?: string; type?: string; value?: string; min?: string; max?: string; step?: string; placeholder?: string; disabled?: boolean; checked?: boolean; hidden?: boolean; id?: string; style?: string; open?: boolean };
 
 /** Tiny DOM builder: h('div', {class:'x', text:'y'}, child, ...). */
 export function h<K extends keyof HTMLElementTagNameMap>(

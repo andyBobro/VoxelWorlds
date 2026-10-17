@@ -132,6 +132,22 @@ export class CameraRig {
     if (this.mode === 'fly') this.syncAnglesFromCamera();
   }
 
+  /** Re-target the orbit camera on a point and zoom to `radius`, keeping the current viewing direction and limits. */
+  focus(center: THREE.Vector3, radius: number): void {
+    if (this.mode === 'fly') this.setMode('orbit');
+    const dir = this.camera.position.clone().sub(this.orbit.target);
+    if (dir.lengthSq() < 1e-9) dir.set(0.55, 0.6, 0.75);
+    dir.normalize();
+    // keep a downward view so the building is not hidden behind neighbours
+    if (dir.y < 0.35) { dir.y = 0.35; dir.normalize(); }
+    const dist = Math.min(Math.max(radius * 4.5, this.orbit.minDistance), Math.max(this.orbit.maxDistance, radius * 5));
+    this.orbit.target.copy(center);
+    this.camera.position.copy(center).addScaledVector(dir, dist);
+    this.orbitDist = dist;
+    this.camera.lookAt(center);
+    this.orbit.update();
+  }
+
   /** Snapshot for returning from a detail scene. */
   saveState(): CameraState {
     return {

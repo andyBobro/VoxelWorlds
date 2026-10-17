@@ -1,4 +1,5 @@
 import type { GenerateStats, Stage } from '../../shared/contract';
+import { stageLabel } from '../lib/geodata';
 import { $ } from './dom';
 
 const STALL_MS = 2500;
@@ -60,7 +61,7 @@ export class ProgressPanel {
       this.lastTile = tileKey;
       this.lastChange = performance.now();
     }
-    this.set(e.pct, `${e.stage}: ${e.message}`);
+    this.set(e.pct, stageLabel(e.stage, e.message));
     if (e.tile && e.tile.total > 0) {
       this.state.textContent = `Tile ${e.tile.done} of ${e.tile.total}`;
       this.state.classList.add('tile-state');

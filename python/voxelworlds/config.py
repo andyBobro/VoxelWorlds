@@ -24,6 +24,10 @@ class Config:
                                       "https://z.overpass-api.de/api", "https://overpass.private.coffee/api",
                                       "https://overpass.kumi.systems/api")
     osm_cache_ttl_s: float = 7 * 86400
+    # local Geofabrik .osm.pbf source (osm/pbf.py)
+    pbf_index_min_bytes: int = 48 * 1024 * 1024    # at/above this size a one-time spatial index is built (else scan)
+    pbf_cell_deg: float = 0.02                     # index cell edge in degrees (~2 km)
+    pbf_disk_locations_bytes: int = 1200 * 1024 * 1024  # larger files keep node locations on disk, not in RAM
     dem_cache_ttl_s: float = 90 * 86400
     mapillary_cache_ttl_s: float = 86400
     mapillary_thumb_ttl_s: float = 30 * 86400

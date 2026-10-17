@@ -49,7 +49,19 @@ export interface GenerateParams {
   defaultBuildingHeight: number;
   /** hard safety cap on emitted voxels; python must fail fast with code VOXEL_LIMIT */
   maxVoxels: number;
+  /** where OSM data comes from; default { kind: 'overpass' } (current behaviour) */
+  dataSource?: DataSource;
 }
+
+/**
+ * OSM data source. 'pbf' reads a locally stored Geofabrik extract (no network once downloaded).
+ * The renderer supplies `regionId`; MAIN resolves it to `pbfPath` (a file under the geodata dir it manages,
+ * verified to exist) before the request reaches python. python rejects kind 'pbf' without pbfPath (BAD_REQUEST)
+ * and never reads other paths. Cached results are keyed by bbox AND source (pbf: regionId + file mtime/size).
+ */
+export type DataSource =
+  | { kind: 'overpass' }
+  | { kind: 'pbf'; regionId: string; pbfPath?: string };
 
 // ───────────────────── main -> python (stdin) ─────────────────────
 
@@ -65,7 +77,7 @@ export type Request =
 
 export type Stage =
   | 'init' | 'osm' | 'dem' | 'mapillary' | 'project' | 'voxelize' | 'texture' | 'serialize' | 'export'
-  | 'analyze' | 'facade' | 'interior';
+  | 'analyze' | 'facade' | 'interior' | 'pbf';
 
 export type Event =
   | { id: string; type: 'ready'; version: string }                       // sent once at startup, id = "boot"
@@ -80,7 +92,8 @@ export type Event =
 
 export type ErrorCode =
   | 'BAD_REQUEST' | 'OSM_FAILED' | 'NO_DATA' | 'VOXEL_LIMIT' | 'CANCELLED' | 'EXPORT_FAILED' | 'INTERNAL'
-  | 'BUILDING_NOT_FOUND' | 'PHOTO_UNREADABLE' | 'FACADE_ANALYSIS_FAILED';
+  | 'BUILDING_NOT_FOUND' | 'PHOTO_UNREADABLE' | 'FACADE_ANALYSIS_FAILED'
+  | 'PBF_UNREADABLE' | 'PBF_NO_COVERAGE' | 'DOWNLOAD_FAILED' | 'WORLD_NOT_FOUND';
 
 export interface GenerateStats {
   voxelCount: number;
@@ -131,6 +144,8 @@ export interface BuildingRef {
   /** the values the original generate used; python falls back to its saved copy, then 3.5 / 10.5 */
   metersPerFloor?: number;
   defaultBuildingHeight?: number;
+  /** same source as the original generate so detail sees identical OSM data (main fills pbfPath) */
+  dataSource?: DataSource;
 }
 
 /** Photo coordinates are image pixels, origin top-left, +x right, +y down. */
@@ -173,6 +188,8 @@ export interface InteriorOptions {
 
 export interface DetailParams {
   ref: BuildingRef;
+  /** world the result is saved into (and whose bbox/dataSource the ref must match); main rejects unknown ids */
+  worldId?: string;
   /** metres per voxel for the detail scene, 0.05 – 0.5 (default 0.15) */
   voxelSize: number;
   /** repaint one wall from a photo-derived spec; edge indexes BuildingInfo.footprint */
@@ -197,19 +214,117 @@ export interface DetailStats {
 // ───────────────────── Renderer API (preload) ─────────────────────
 
 export interface VoxelApi {
-  generate(params: GenerateParams): Promise<{ vwgPath: string; stats: GenerateStats }>;
+  /**
+   * The result is auto-saved as a world. On success `world` is that saved world (now the current one) and
+   * vwgPath/stats.buildingIndexPath point into the library; if saving failed, `world` is absent, `saveError`
+   * says why, vwgPath is a temp file and NO world is current.
+   */
+  generate(params: GenerateParams): Promise<{ vwgPath: string; stats: GenerateStats; world?: WorldMeta; saveError?: string }>;
   cancel(): Promise<void>;
   readBuildingIndex(buildingIndexPath: string): Promise<BuildingIndex>;
   /** opens a native file picker; returns a local path (+ a data: or file: URL the renderer can display) */
   pickPhoto(): Promise<{ photoPath: string; previewUrl: string } | null>;
   analyzeFacade(params: AnalyzeFacadeParams): Promise<{ spec: FacadeSpec; rectifiedPath: string }>;
-  detail(params: DetailParams): Promise<{ vwgPath: string; stats: DetailStats }>;
+  /** result is auto-saved into the current world (see worlds API); `record` is its saved entry */
+  detail(params: DetailParams): Promise<{ vwgPath: string; stats: DetailStats; record?: DetailRecord }>;
+
+  // ── Worlds library: every generate is auto-saved; details (incl. interiors) are saved into their world ──
+  listWorlds(): Promise<WorldMeta[]>;
+  /** loads a saved world as the current one (readVwg/readBuildingIndex/detail/export trust it) */
+  openWorld(worldId: string): Promise<{ vwgPath: string; stats: GenerateStats; buildingIndexPath?: string; meta: WorldMeta }>;
+  renameWorld(worldId: string, name: string): Promise<WorldMeta>;
+  deleteWorld(worldId: string): Promise<void>;
+  /** details of the given world, newest first (all detail calls are explicit about the world; main keeps no hidden 'current' for them) */
+  listDetails(worldId: string): Promise<DetailRecord[]>;
+  /** opens a saved detail instantly (no python); the returned vwgPath works with readVwg/exportAs */
+  openDetail(worldId: string, detailId: string): Promise<{ vwgPath: string; stats: DetailStats; record: DetailRecord }>;
+  deleteDetail(worldId: string, detailId: string): Promise<void>;
+  /** fires after a generate or detail has been saved */
+  onWorldSaved(cb: (e: { world: WorldMeta; detail?: DetailRecord }) => void): () => void;
+
+  // ── Geodata: Geofabrik .osm.pbf extracts, downloaded once and reused offline ──
+  /** Geofabrik region catalogue (index-v1.json, cached locally; works offline from cache) */
+  listGeodataRegions(opts?: { refresh?: boolean }): Promise<GeodataRegion[]>;
+  /** regions whose polygon covers the bbox, smallest first */
+  suggestGeodataRegions(bbox: BBox): Promise<GeodataRegion[]>;
+  listGeodata(): Promise<GeodataEntry[]>;
+  downloadGeodata(regionId: string): Promise<GeodataEntry>;     // resumable; rejects DOWNLOAD_FAILED / CANCELLED
+  cancelGeodataDownload(regionId?: string): Promise<void>;
+  deleteGeodata(regionId: string): Promise<void>;
+  onGeodataProgress(cb: (e: GeodataProgress) => void): () => void;
   /** vwgPath optional: export that known .vwg (e.g. a detail scene) instead of the last generate's */
   exportAs(format: ExportFormat, suggestedName: string, vwgPath?: string): Promise<{ outputPath: string } | null>; // null = user cancelled dialog
   readVwg(vwgPath: string): Promise<ArrayBuffer>;  // raw .vwg bytes; renderer parses with parseVwg()
   onProgress(cb: (e: { stage: Stage; pct: number; message: string; tile?: { done: number; total: number } }) => void): () => void; // returns unsubscribe
   onWarning(cb: (e: { code: string; message: string }) => void): () => void;
   onLog(cb: (line: string) => void): () => void;   // python stderr
+}
+
+// ───────────────────── Worlds library (persistence) ─────────────────────
+
+/** Stored under the app's userData dir: worlds/<id>/{meta.json, world.vwg, world.buildings.json, details/<detailId>.{vwg,json}} */
+export interface WorldMeta {
+  formatVersion?: 1;                 // written by main; absent = legacy, normalised on load
+  id: string;                         // uuid-ish, directory name
+  name: string;                       // user-editable, default "<bbox centre> <date>"
+  createdAt: string;                  // ISO
+  updatedAt: string;
+  bbox: BBox;
+  voxelSize: number;
+  /** generate params used (mapillaryToken is NEVER stored) */
+  params: Omit<GenerateParams, 'mapillaryToken'>;
+  stats: GenerateStats;
+  sizeBytes: number;                  // world + all its details on disk
+  hasBuildingIndex: boolean;
+  /** for local-extract worlds: the extract's identity when the world was generated (staleness warning) */
+  sourceInfo?: { sizeBytes: number; sourceDate?: string };
+  details: DetailRecord[];            // newest first
+}
+
+export interface DetailRecord {
+  id: string;
+  worldId: string;
+  buildingId: string;                 // BuildingInfo.id (renderer marks these buildings in the city view)
+  buildingName?: string;
+  createdAt: string;
+  voxelSize: number;
+  interior: boolean;
+  facade?: { edge: number };          // present when a photo facade was painted
+  stats: DetailStats;
+  sizeBytes: number;
+}
+
+// ───────────────────── Geodata (Geofabrik extracts) ─────────────────────
+
+export interface GeodataRegion {
+  id: string;                         // Geofabrik id, e.g. "switzerland", "germany/berlin"
+  name: string;
+  parent?: string;                    // parent region id
+  pbfUrl: string;                     // https://download.geofabrik.de/.../xxx-latest.osm.pbf
+  sizeBytes?: number;                 // from HEAD/Content-Length when known
+  downloaded?: boolean;               // filled by main
+  /** only set by suggestGeodataRegions: true = fully covers the bbox, false = merely overlaps it */
+  covers?: boolean;
+}
+
+export interface GeodataEntry {
+  regionId: string;
+  name: string;
+  pbfPath: string;                    // under <userData>/geodata
+  sizeBytes: number;
+  downloadedAt: string;               // ISO
+  /** Last-Modified of the remote file at download time (data freshness), when known */
+  sourceDate?: string;
+  verified: boolean;                  // md5 matched Geofabrik's .md5 (false if no .md5 available)
+}
+
+export interface GeodataProgress {
+  regionId: string;
+  phase: 'download' | 'verify' | 'done' | 'error';
+  receivedBytes: number;
+  totalBytes?: number;
+  bytesPerSec?: number;
+  message?: string;
 }
 
 // ───────────────────── .vwg voxel file format ─────────────────────

@@ -23,7 +23,10 @@ export class ExportPanel {
   }
 
   private sync(): void {
-    for (const b of this.buttons.values()) b.disabled = !this.enabled || this.busy;
+    for (const b of this.buttons.values()) {
+      b.disabled = !this.enabled || this.busy;
+      b.title = b.disabled ? (this.busy ? 'An export is running' : 'Generate or open a world first') : '';
+    }
   }
 
   private async export(f: ExportFormat): Promise<void> {

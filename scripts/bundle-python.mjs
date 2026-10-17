@@ -92,7 +92,7 @@ for (const f of readdirSync(join(dest, 'bin'))) {
   if (!/^python3?(\.\d+)?$/.test(f)) kill(join(dest, 'bin', f));
 }
 
-execFileSync(py, ['-I', '-c', 'import ssl, osmnx, shapely, pyproj, numpy, PIL, mapbox_vector_tile, geopandas, pandas, requests; print("imports ok")'], { stdio: 'inherit', env });
+execFileSync(py, ['-I', '-c', 'import ssl, osmnx, osmium, shapely, pyproj, numpy, PIL, mapbox_vector_tile, geopandas, pandas, requests; print("imports ok")'], { stdio: 'inherit', env });
 // the import check may recreate caches
 walk(dest, (p, n) => { if (n === '__pycache__') { kill(p); return 'skip'; } });
 writeFileSync(stamp, stampValue);

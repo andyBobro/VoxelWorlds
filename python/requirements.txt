@@ -7,3 +7,4 @@ pandas==2.3.3
 requests==2.34.2
 pillow==12.3.0
 mapbox-vector-tile==2.2.0
+osmium==4.3.1

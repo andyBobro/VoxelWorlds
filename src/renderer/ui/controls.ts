@@ -1,6 +1,7 @@
 import type { BBox, GenerateParams } from '../../shared/contract';
 import { INT32_AXIS_LIMIT, INT32_FLAT_LIMIT, estimateBBox, fmtCount } from '../map/estimate';
 import { $ } from './dom';
+import type { DataSourceControl } from './dataSource';
 
 const TOKEN_KEY = 'voxelworlds.mapillaryToken';
 const SETTINGS_KEY = 'voxelworlds.settings';
@@ -56,7 +57,8 @@ export class Controls {
   private external = '';
   private voxelSize = 1;
 
-  constructor(handlers: { onGenerate(): void; onCancel(): void }) {
+  constructor(handlers: { onGenerate(): void; onCancel(): void }, private readonly source: DataSourceControl) {
+    source.onChange = () => this.syncButtons();
     this.token.value = localStorage.getItem(TOKEN_KEY) ?? '';
     this.token.addEventListener('input', () => localStorage.setItem(TOKEN_KEY, this.token.value.trim()));
     this.loadSettings();
@@ -170,6 +172,7 @@ export class Controls {
 
   setBBox(b: BBox | null): void {
     this.bbox = b;
+    this.source.setBBox(b);
     this.renderBBox();
     this.syncButtons();
   }
@@ -266,6 +269,7 @@ export class Controls {
     else if (!this.bbox) reason = 'Draw a rectangle on the map first';
     else if (this.tooBig) reason = this.blocked;
     else if (problem) reason = `Fix the invalid setting: ${problem}`;
+    else reason = this.source.blockReason();
     this.btnGenerate.disabled = this.busy || !!reason;
     this.btnGenerate.title = this.btnGenerate.disabled && reason ? reason : '';
     this.genRow.title = this.btnGenerate.title;
@@ -297,6 +301,34 @@ export class Controls {
       metersPerFloor: mpf,
       defaultBuildingHeight: height,
       maxVoxels: Math.round((parseDecimal(this.maxVox.value) ?? 50) * 1e6),
+      dataSource: this.source.getSource(),
     };
+  }
+
+  /** Fill the form from saved-world params. Defensive: legacy/partial params keep the current value of any missing or invalid field. */
+  applyParams(p: Partial<Omit<GenerateParams, 'mapillaryToken'>> | null | undefined): void {
+    if (!p) return;
+    const fin = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+    const set = (el: HTMLInputElement, v: unknown, min: number, max: number, div = 1): void => {
+      if (fin(v)) el.value = String(Number((Math.max(min, Math.min(max, v / div))).toFixed(4)));
+    };
+    if (fin(p.voxelSize)) {
+      this.voxelSize = Math.max(VOXEL_MIN, Math.min(VOXEL_MAX, p.voxelSize));
+      this.sizeNum.value = fmtSize(this.voxelSize);
+      this.size.value = String(sizeToSlider(this.voxelSize));
+    }
+    set(this.tile, p.tileSize, 50, 5000);
+    if (fin(p.workers)) set(this.workers, Math.round(p.workers), 0, 16);
+    set(this.maxVox, p.maxVoxels, 1, 250, 1e6);
+    const f = p.features;
+    if (f && typeof f === 'object') {
+      if (typeof f.roads === 'boolean') this.roads.checked = f.roads;
+      if (typeof f.elevation === 'boolean') this.elevation.checked = f.elevation;
+      if (typeof f.proceduralFacades === 'boolean') this.facades.checked = f.proceduralFacades;
+    }
+    set(this.mpf, p.metersPerFloor, 1, 10);
+    set(this.height, p.defaultBuildingHeight, 1, 500);
+    this.source.setSource(p.dataSource);
+    this.onSettingChanged();
   }
 }

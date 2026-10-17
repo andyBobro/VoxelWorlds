@@ -24,6 +24,7 @@
             </span>
             <input id="voxel-size" type="range" min="0" max="35" step="1" value="19" />
           </label>
+          <div id="source-box" class="source-box"></div>
           <label class="field">
             <span>Mapillary token</span>
             <input id="mapillary-token" type="password" placeholder="optional" autocomplete="off" spellcheck="false" />
@@ -94,11 +95,15 @@
         <nav class="tabs">
           <button class="tab active" data-tab="map">Map</button>
           <button class="tab" data-tab="preview">3D Preview</button>
+          <button class="tab" data-tab="worlds">Worlds <span id="worlds-badge" class="tab-badge" hidden></span></button>
         </nav>
         <section id="tab-map" class="tabpane active"><div id="map"></div></section>
         <section id="tab-preview" class="tabpane">
           <div id="preview-container"></div>
           <label id="ao-toggle" title="Bake ambient occlusion into the voxels (O)"><input type="checkbox" id="ao-check" disabled /> Ambient occlusion</label>
+          <label id="marker-toggle" title="Show markers on buildings that have saved details" hidden>
+            <input type="checkbox" id="marker-check" checked /> <i class="mk-swatch"></i> <span id="marker-count"></span>
+          </label>
           <aside id="building-panel" hidden></aside>
           <div id="preview-empty" class="empty">Generate a world to see the preview.</div>
           <div id="preview-failed" class="empty" hidden>
@@ -108,6 +113,7 @@
             </div>
           </div>
         </section>
+        <section id="tab-worlds" class="tabpane"><div id="worlds-root" class="worlds-root"></div></section>
       </main>
     </div>
     <script type="module" src="./main.ts"></script>

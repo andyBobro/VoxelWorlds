@@ -3,6 +3,9 @@ import { parseVwg, type VwgData } from '../../shared/vwg';
 import { CameraRig, type CameraMode, type CameraState } from './camera';
 import { Hud } from './hud';
 import { Highlight, type HighlightSpec } from './highlight';
+import { Markers } from './markers';
+import { buildingFocus } from './markerGeometry';
+import type { BuildingInfo } from '../../shared/contract';
 import { VoxelWorld } from './world';
 
 export type { CameraMode } from './camera';
@@ -36,6 +39,11 @@ export interface PreviewHandle {
   inDetail(): boolean;
   /** Cutaway: show everything up to and including floor slab `level` (index into floorYs); null = no clip. Does not remesh. */
   setCutaway(slabY: number | null): void;
+  /** Overlay markers (no re-mesh) for buildings with saved details; null/empty clears. Survives only until the next load(). */
+  setMarkers(buildings: readonly BuildingInfo[] | null): void;
+  setMarkersVisible(v: boolean): void;
+  /** Smoothly keeps orbit limits; moves the orbit target to the building and zooms to fit. City scene only. */
+  focusBuilding(b: BuildingInfo): void;
 }
 
 /** AO adds ~1.3-2x triangles; above this many voxels it defaults to off (re-enable with setAmbientOcclusion). */
@@ -73,13 +81,31 @@ export function buildingBounds(data: VwgData): THREE.Box3 | null {
   return new THREE.Box3(new THREE.Vector3(x0 * vs, y0 * vs, z0 * vs), new THREE.Vector3((x1 + 1) * vs, (y1 + 1) * vs, (z1 + 1) * vs));
 }
 
+let quietUntil = 0;
+let warnPatched = false;
+/** three logs a 'Context Lost' warning for every deliberate forceContextLoss(); swallow only that one, only briefly. */
+function quietContextLoss(): void {
+  quietUntil = Date.now() + 500;
+  if (warnPatched) return;
+  warnPatched = true;
+  const orig = console.warn.bind(console);
+  console.warn = (...a: unknown[]): void => {
+    if (Date.now() < quietUntil && typeof a[0] === 'string' && /Context Lost/i.test(a[0])) return;
+    orig(...a);
+  };
+}
+
 export function mountPreview(container: HTMLElement): PreviewHandle {
   if (getComputedStyle(container).position === 'static') container.style.position = 'relative';
   container.style.overflow = 'hidden';
 
-  const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: 'high-performance' });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-  renderer.setClearColor(SKY);
+  // The sky is a CSS gradient behind a transparent canvas (not a scene.background texture): it cannot go black when GL
+  // state/textures are lost or replaced (seen after a detail round trip), and costs no texture upload.
+  renderer.setClearColor(0x000000, 0);
+  const skyHex = '#' + SKY.toString(16).padStart(6, '0');
+  container.style.background = `linear-gradient(to bottom, ${SKY_TOP} 0%, ${skyHex} 55%, ${skyHex} 100%)`;
   renderer.localClippingEnabled = true; // detail-scene floor cutaway (material.clippingPlanes)
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFShadowMap;
@@ -89,23 +115,8 @@ export function mountPreview(container: HTMLElement): PreviewHandle {
   canvas.tabIndex = 0;
   container.appendChild(canvas);
 
-  const skyCanvas = document.createElement('canvas');
-  skyCanvas.width = 2;
-  skyCanvas.height = 256;
-  {
-    const g2 = skyCanvas.getContext('2d')!;
-    const grad = g2.createLinearGradient(0, 0, 0, 256);
-    grad.addColorStop(0, SKY_TOP);
-    grad.addColorStop(0.55, '#' + SKY.toString(16).padStart(6, '0'));
-    grad.addColorStop(1, '#' + SKY.toString(16).padStart(6, '0'));
-    g2.fillStyle = grad;
-    g2.fillRect(0, 0, 2, 256);
-  }
-  const skyTex = new THREE.CanvasTexture(skyCanvas);
-  skyTex.colorSpace = THREE.SRGBColorSpace;
   const makeScene = (shadowSize: number): { scene: THREE.Scene; sun: THREE.DirectionalLight } => {
     const sc = new THREE.Scene();
-    sc.background = skyTex;
     sc.fog = new THREE.Fog(SKY, 100, 1000);
     const hemi = new THREE.HemisphereLight(0xdfeeff, 0x6b6558, 1.1);
     const sn = new THREE.DirectionalLight(0xffffff, 2.0);
@@ -189,7 +200,13 @@ export function mountPreview(container: HTMLElement): PreviewHandle {
   };
   rig.onModeChange = syncCrosshair;
 
+  let markers: Markers | null = null;
+  let markersVisible = true;
+
   const clearWorld = (): void => {
+    markers?.dispose();
+    if (markers) cityScene.remove(markers.group);
+    markers = null;
     if (cityWorld) {
       cityScene.remove(cityWorld.group);
       cityWorld.dispose();
@@ -387,6 +404,29 @@ export function mountPreview(container: HTMLElement): PreviewHandle {
     },
     getVoxelSize: () => cityWorld?.voxelSize ?? 0,
 
+    setMarkers(list: readonly BuildingInfo[] | null): void {
+      if (!cityWorld) return;
+      if (!list || list.length === 0) {
+        markers?.set([]); // keep the overlay (and its texture) for the next non-empty call
+        return;
+      }
+      if (!markers) {
+        markers = new Markers(cityWorld.voxelSize);
+        cityScene.add(markers.group);
+      }
+      markers.set(list);
+      markers.group.visible = markersVisible;
+    },
+    setMarkersVisible(v: boolean): void {
+      markersVisible = v;
+      if (markers) markers.group.visible = v;
+    },
+    focusBuilding(b: BuildingInfo): void {
+      if (!cityWorld || detail) return;
+      const f = buildingFocus(b), vs = cityWorld.voxelSize;
+      rig.focus(new THREE.Vector3(f.cx * vs, f.cy * vs, f.cz * vs), Math.max(f.radius * vs, vs * 4));
+    },
+
     showDetail(buf: ArrayBuffer): DetailInfo {
       if (disposed || !cityWorld) throw new Error('No city scene loaded');
       const data = parseVwg(buf);
@@ -460,8 +500,9 @@ export function mountPreview(container: HTMLElement): PreviewHandle {
       citySun.shadow.map?.dispose();
       citySun.shadow.map = null;
       material.dispose();
-      skyTex.dispose();
+      container.style.background = '';
       renderer.dispose();
+      quietContextLoss();
       renderer.forceContextLoss(); // release the GL context now; a new renderer is created on every (re)load
       canvas.remove();
     },

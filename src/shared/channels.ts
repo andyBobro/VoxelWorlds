@@ -11,4 +11,21 @@ export const CH = {
   progress: 'voxel:progress',
   warning: 'voxel:warning',
   log: 'voxel:log',
+  // worlds library
+  listWorlds: 'voxel:worlds:list',
+  openWorld: 'voxel:worlds:open',
+  renameWorld: 'voxel:worlds:rename',
+  deleteWorld: 'voxel:worlds:delete',
+  listDetails: 'voxel:worlds:listDetails',
+  openDetail: 'voxel:worlds:openDetail',
+  deleteDetail: 'voxel:worlds:deleteDetail',
+  worldSaved: 'voxel:worlds:saved',
+  // geodata (Geofabrik extracts)
+  listGeodataRegions: 'voxel:geodata:regions',
+  suggestGeodataRegions: 'voxel:geodata:suggest',
+  listGeodata: 'voxel:geodata:list',
+  downloadGeodata: 'voxel:geodata:download',
+  cancelGeodataDownload: 'voxel:geodata:cancel',
+  deleteGeodata: 'voxel:geodata:delete',
+  geodataProgress: 'voxel:geodata:progress',
 } as const;

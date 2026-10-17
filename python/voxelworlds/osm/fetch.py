@@ -25,6 +25,7 @@ URBAN_LANDUSE = {"residential", "commercial", "retail", "industrial", "construct
                  "garages", "brownfield", "education", "institutional"}
 
 
+_FOREVER = 50 * 365 * 86400.0
 _GAP_LOCK = threading.Lock()
 _LAST_START = [0.0]
 _MIN_GAP_S = 1.0
@@ -118,15 +119,17 @@ def _empty():
     return gpd.GeoDataFrame(geometry=[], crs=4326)
 
 
-def _fetch_chunk(box: tuple, want_roads: bool, cfg: Config, stop: threading.Event):
+def _fetch_chunk(box: tuple, want_roads: bool, cfg: Config, stop: threading.Event, allow_stale: bool = False):
     """One Overpass query (west, south, east, north) with disk cache and polite retry/backoff."""
     import osmnx as ox
     from osmnx._errors import InsufficientResponseError
 
     key = "osm|v6-manmade|%.6f,%.6f,%.6f,%.6f|roads=%d" % (*box, int(want_roads))
-    hit = cache.get_obj("osm", key, cfg.osm_cache_ttl_s)
+    hit = cache.get_obj("osm", key, _FOREVER if allow_stale else cfg.osm_cache_ttl_s)
     if hit is not None:
         return hit
+    if allow_stale:        # detail never goes to the network
+        raise PipelineError("NO_DATA", "OSM cache for this area is missing: generate the scene again")
     ox.settings.log_console = False
     ox.settings.use_cache = True
     ox.settings.cache_folder = os.path.join(tempfile.gettempdir(), "voxelworlds-osm-cache")
@@ -165,24 +168,45 @@ def _fetch_chunk(box: tuple, want_roads: bool, cfg: Config, stop: threading.Even
                         f"{' '.join(str(last).split())[:200]}")
 
 
-def cached_roads_variant(bbox: dict, cfg: Config) -> bool:
+def cached_roads_variant(bbox: dict, cfg: Config, source=None, allow_stale: bool = False) -> bool:
     """True when every Overpass chunk of ``bbox`` is in the disk cache with roads=1 (the generate default), so
-    a repeat fetch with want_roads=True is a pure cache hit; otherwise callers fall back to roads=0."""
+    a repeat fetch with want_roads=True is a pure cache hit; otherwise callers fall back to roads=0.
+    With a pbf ``source`` (osm.pbf.PbfSource) see pbf.cached_roads_variant."""
+    if source is not None:
+        from . import pbf
+        return pbf.cached_roads_variant(bbox, source)
     for box in chunk_boxes(bbox, cfg):
         key = "osm|v6-manmade|%.6f,%.6f,%.6f,%.6f|roads=%d" % (*box, 1)
-        if not cache.has("osm", key, cfg.osm_cache_ttl_s):
+        if not cache.has("osm", key, _FOREVER if allow_stale else cfg.osm_cache_ttl_s):
             return False
     return True
 
 
-def cached_any(bbox: dict, cfg: Config) -> bool:
+def cached_any(bbox: dict, cfg: Config, source=None, allow_stale: bool = False) -> bool:
     """True when every chunk of ``bbox`` is in the disk cache (with or without roads): fetching it again does not
-    hit the network, so building data equals what the generate run saw."""
+    hit the network, so building data equals what the generate run saw. For a pbf ``source`` this is True while
+    the file exists (a missing bbox cache is rebuilt locally from the file)."""
+    if source is not None:
+        from . import pbf
+        return pbf.cached_any(bbox, source)
     for box in chunk_boxes(bbox, cfg):
-        if not any(cache.has("osm", "osm|v6-manmade|%.6f,%.6f,%.6f,%.6f|roads=%d" % (*box, r), cfg.osm_cache_ttl_s)
+        if not any(cache.has("osm", "osm|v6-manmade|%.6f,%.6f,%.6f,%.6f|roads=%d" % (*box, r),
+                             _FOREVER if allow_stale else cfg.osm_cache_ttl_s)
                    for r in (1, 0)):
             return False
     return True
+
+
+def oldest_cached(bbox: dict, cfg: Config) -> Optional[float]:
+    """Write time (epoch s) of the oldest cached chunk of ``bbox`` (expired or not), None if any chunk is absent."""
+    oldest = None
+    for box in chunk_boxes(bbox, cfg):
+        ts = [cache.mtime("osm", "osm|v6-manmade|%.6f,%.6f,%.6f,%.6f|roads=%d" % (*box, r)) for r in (1, 0)]
+        ts = [t for t in ts if t is not None]
+        if not ts:
+            return None
+        oldest = min(ts + ([oldest] if oldest is not None else []))
+    return oldest
 
 
 def chunk_boxes(bbox: dict, cfg: Config) -> List[tuple]:
@@ -204,14 +228,20 @@ def chunk_boxes(bbox: dict, cfg: Config) -> List[tuple]:
 
 
 def fetch_features(bbox: dict, want_roads: bool, cfg: Config, stop: threading.Event,
-                   on_chunk: Optional[Callable[[int, int], None]] = None):
+                   on_chunk: Optional[Callable[[int, int], None]] = None, source=None,
+                   on_pbf: Optional[Callable[[float, str], None]] = None, allow_stale: bool = False):
     """Buildings/parts, optional roads, water, landuse for the bbox as a WGS84 gdf (possibly empty).
+    ``source`` (osm.pbf.PbfSource) switches to a local Geofabrik extract with the identical frame layout;
+    ``on_pbf(fraction, message)`` reports its progress (stage 'pbf').
     Large boxes are split into chunks fetched with at most cfg.overpass_concurrency concurrent requests;
     responses are cached on disk and features duplicated across chunk borders are dropped by OSM id.
     Raises PipelineError(OSM_FAILED) on network/server failure."""
     import geopandas as gpd
     import pandas as pd
 
+    if source is not None:
+        from . import pbf
+        return pbf.fetch_features(bbox, want_roads, cfg, stop, source, on_pbf)
     boxes = chunk_boxes(bbox, cfg)
     frames = []
     done = 0
@@ -220,7 +250,7 @@ def fetch_features(bbox: dict, want_roads: bool, cfg: Config, stop: threading.Ev
     ex = ThreadPoolExecutor(max_workers=max(1, cfg.overpass_concurrency))
     futs: list = []
     try:
-        futs = [ex.submit(_fetch_chunk, b, want_roads, cfg, both) for b in boxes]
+        futs = [ex.submit(_fetch_chunk, b, want_roads, cfg, both, allow_stale) for b in boxes]
         results: dict = {}
         for f in as_completed(futs):  # first failure surfaces immediately; merge order stays by chunk index
             results[futs.index(f)] = f.result()

@@ -16,6 +16,7 @@ from . import __version__, cache
 from .config import DEFAULT_CONFIG, Config
 from .osm import dem as demmod
 from .osm import fetch as osmfetch
+from .osm import pbf as pbfmod
 from .protocol import Cancelled, Job, PipelineError, log
 from .tiles import M, MATS, TilePool, TileTask, plan_tiles, run_tiles
 from .voxel import props as props_mod
@@ -60,7 +61,7 @@ def _validate(p: dict) -> None:
 
 
 # overall-progress ranges per stage when the run is tiled (pct then means whole-job progress)
-_RANGES = {"init": (0, 2), "osm": (2, 15), "dem": (15, 20), "mapillary": (20, 30), "project": (30, 30),
+_RANGES = {"init": (0, 2), "osm": (2, 15), "pbf": (2, 15), "dem": (15, 20), "mapillary": (20, 30), "project": (30, 30),
            "voxelize": (30, 95), "texture": (30, 95), "serialize": (95, 100)}
 
 
@@ -116,6 +117,9 @@ def generate(job: Job, p: dict, cfg: Config = DEFAULT_CONFIG) -> None:
     t0 = time.time()
     _validate(p)
     bbox = {k: float(p["bbox"][k]) for k in ("latMin", "lonMin", "latMax", "lonMax")}
+    src = pbfmod.resolve_source(p.get("dataSource"))      # None = Overpass; BAD_REQUEST on a bad pbf source
+    if src is not None:
+        pbfmod.check_coverage(src, bbox)                  # PBF_UNREADABLE / PBF_NO_COVERAGE before any work
     vs = float(p["voxelSize"])
     feats = p["features"]
     mpf = float(p["metersPerFloor"])
@@ -149,23 +153,30 @@ def generate(job: Job, p: dict, cfg: Config = DEFAULT_CONFIG) -> None:
         if n_tiles > 1 and workers > 1:
             pool = TilePool(workers)  # warm up while the network stages run
         _generate(job, prog, p, cfg, t0, bbox, vs, feats, mpf, def_h, max_vox, token, grid, to_utm,
-                  cores, workers, pool)
+                  cores, workers, pool, src)
     finally:
         if pool is not None:
             pool.close(kill=True)  # no-op for workers already stopped; guarantees no orphans
 
 
 def _generate(job, prog, p, cfg, t0, bbox, vs, feats, mpf, def_h, max_vox, token, grid, to_utm,
-              cores, workers, pool) -> None:
+              cores, workers, pool, src=None) -> None:
     n_tiles = len(cores)
-    # ---- OSM
-    prog("osm", 0, "Querying Overpass")
+    # ---- OSM (Overpass, or a local Geofabrik .osm.pbf: stage 'pbf')
     stop = job.cancel_event
-    tick_osm = prog.sub("osm", 0, 80, "Querying Overpass")
-    gdf = job.run_blocking(
-        lambda: osmfetch.fetch_features(bbox, bool(feats.get("roads")), cfg, stop,
-                                        lambda d, n: tick_osm(d / n)),
-        "Querying Overpass", "this can be slow on first request")
+    if src is None:
+        prog("osm", 0, "Querying Overpass")
+        tick_osm = prog.sub("osm", 0, 80, "Querying Overpass")
+        gdf = job.run_blocking(
+            lambda: osmfetch.fetch_features(bbox, bool(feats.get("roads")), cfg, stop,
+                                            lambda d, n: tick_osm(d / n)),
+            "Querying Overpass", "this can be slow on first request")
+    else:
+        prog("pbf", 0, f"Reading region '{src.region_id}'")
+        gdf = job.run_blocking(
+            lambda: osmfetch.fetch_features(bbox, bool(feats.get("roads")), cfg, stop, source=src,
+                                            on_pbf=lambda f, m: prog("pbf", f * 80.0, m)),
+            "Reading OSM extract", "the first use of a large region builds a one-time index", unwind=1.0)
     prog("osm", 80, f"Received {len(gdf)} features")
     if len(gdf):
         gdf = gdf[gdf.geometry.notna()]

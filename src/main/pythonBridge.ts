@@ -33,6 +33,8 @@ export interface BridgeOptions {
   /** true in a packaged app: python lives in process.resourcesPath */
   packaged?: boolean;
   tempDir: string;
+  /** persistent cache dir handed to python as VOXEL_CACHE_DIR (an already-set env var wins) */
+  cacheDir?: string;
   listeners: BridgeListeners;
 }
 
@@ -113,6 +115,7 @@ export class PythonBridge {
             PYTHONUNBUFFERED: '1',
             PYTHONIOENCODING: 'utf-8',
             VOXEL_TMP_DIR: this.opts.tempDir,
+            ...(!childEnv.VOXEL_CACHE_DIR && this.opts.cacheDir ? { VOXEL_CACHE_DIR: this.opts.cacheDir } : {}),
           },
         });
       } catch (e) {

@@ -1,3 +1,4 @@
+import type { BuildingInfo } from '../../shared/contract';
 import type { HighlightSpec, PreviewHandle, SurfaceHit } from '../preview';
 export type { HighlightSpec, SurfaceHit };
 
@@ -17,6 +18,8 @@ export class PreviewHost {
 
   private pickCb: ((hit: SurfaceHit | null) => void) | null = null;
   private hl: HighlightSpec | null = null;
+  private markers: readonly BuildingInfo[] | null = null;
+  private markersVisible = true;
 
   /** Click-pick callback (survives remounts). */
   set onPick(cb: ((hit: SurfaceHit | null) => void) | null) {
@@ -28,6 +31,16 @@ export class PreviewHost {
     this.hl = h;
     this.handle?.setHighlight(h);
   }
+  /** Saved-detail markers; remembered here so they survive the dispose + remount done on every (re)load. */
+  setMarkers(list: readonly BuildingInfo[] | null): void {
+    this.markers = list && list.length ? list : null;
+    this.handle?.setMarkers(this.markers);
+  }
+  setMarkersVisible(v: boolean): void {
+    this.markersVisible = v;
+    this.handle?.setMarkersVisible(v);
+  }
+  focusBuilding(b: BuildingInfo): void { this.handle?.focusBuilding(b); }
   get voxelSize(): number { return this.handle?.getVoxelSize() ?? 0; }
   get inDetail(): boolean { return this.handle?.inDetail() ?? false; }
   showDetail(buf: ArrayBuffer): void { this.handle?.showDetail(buf); this.container.querySelector('canvas')?.focus({ preventScroll: true }); }
@@ -74,6 +87,8 @@ export class PreviewHost {
     this.handle.onPick = this.pickCb;
     this.handle.load(buf);
     this.hl = null;
+    this.handle.setMarkersVisible(this.markersVisible);
+    this.handle.setMarkers(this.markers);
     let s = this.handle.getAmbientOcclusion();
     if (this.userAo !== null && s.available && s.on !== this.userAo) {
       this.handle.setAmbientOcclusion(this.userAo);

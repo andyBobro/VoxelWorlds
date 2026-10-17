@@ -135,11 +135,13 @@ class Job:
         msg.update(payload)
         self._send(msg, terminal=True)
 
-    def run_blocking(self, fn: Callable[[], Any], label: str, note: str = "", poll: Optional[float] = None) -> Any:
+    def run_blocking(self, fn: Callable[[], Any], label: str, note: str = "", poll: Optional[float] = None,
+                     unwind: float = 0.0) -> Any:
         """Run blocking ``fn`` on a daemon thread; poll cancel every POLL_S and emit a heartbeat
         progress (same stage/pct, message with elapsed seconds) every HEARTBEAT_S. On cancel the worker
         is abandoned (its late result/exception is swallowed; events from it are dropped once the job
-        is closed) and Cancelled is raised immediately."""
+        is closed) and Cancelled is raised immediately. With ``unwind`` > 0 a cancelled job first waits up to that
+        many seconds for the worker to finish unwinding (e.g. delete its temp files) before raising."""
         box: Dict[str, Any] = {}
         done = threading.Event()
 
@@ -154,15 +156,23 @@ class Job:
         threading.Thread(target=target, daemon=True).start()
         t0 = time.monotonic()
         next_beat = t0 + self.HEARTBEAT_S
+        def checked() -> None:
+            try:
+                self.check()
+            except Cancelled:
+                if unwind > 0:
+                    done.wait(unwind)
+                raise
+
         while not done.wait(poll or self.POLL_S):
-            self.check()
+            checked()
             now = time.monotonic()
             if now >= next_beat:
                 next_beat = now + self.HEARTBEAT_S
                 stage, pct, base, tile = self._last
                 msg = f"{label}\u2026 {int(now - t0)} s" + (f" ({note})" if note else "")
                 self.progress(stage, pct, msg, _beat=True, tile=tile)
-        self.check()
+        checked()
         if "e" in box:
             raise box["e"]
         return box.get("v")

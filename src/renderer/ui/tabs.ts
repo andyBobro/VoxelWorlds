@@ -1,4 +1,4 @@
-export type TabName = 'map' | 'preview';
+export type TabName = 'map' | 'preview' | 'worlds';
 
 export class Tabs {
   private buttons = Array.from(document.querySelectorAll<HTMLButtonElement>('.tab'));

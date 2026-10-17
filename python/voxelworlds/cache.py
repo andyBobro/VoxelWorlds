@@ -97,6 +97,14 @@ def has(kind: str, key: str, ttl_s: float) -> bool:
         return False
 
 
+def mtime(kind: str, key: str) -> Optional[float]:
+    """Write time of a cache entry (expired or not), None when absent."""
+    try:
+        return os.path.getmtime(_path(kind, key))
+    except OSError:
+        return None
+
+
 def get_obj(kind: str, key: str, ttl_s: float) -> Optional[Any]:
     b = get_bytes(kind, key, ttl_s)
     if b is None:
