@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>VoxelWorlds</title>
+  </head>
+  <body>
+    <div id="app">
+      <aside id="sidebar">
+        <header class="brand"><span class="logo"></span> VoxelWorlds</header>
+
+        <section class="panel">
+          <h2>Area</h2>
+          <div id="bbox-info" class="muted">Draw a rectangle on the map.</div>
+          <div id="bbox-warn" class="warn slot-warn" aria-live="polite"></div>
+        </section>
+
+        <section class="panel">
+          <h2>Settings</h2>
+          <label class="field">
+            <span>Voxel size (m)
+              <input id="voxel-size-num" class="inline-num" type="text" inputmode="decimal" autocomplete="off" value="1" aria-label="Voxel size in metres" />
+            </span>
+            <input id="voxel-size" type="range" min="0" max="35" step="1" value="19" />
+          </label>
+          <label class="field">
+            <span>Mapillary token</span>
+            <input id="mapillary-token" type="password" placeholder="optional" autocomplete="off" spellcheck="false" />
+          </label>
+          <label class="check"><input id="opt-roads" type="checkbox" checked /> Roads</label>
+          <label class="check"><input id="opt-elevation" type="checkbox" checked /> Elevation</label>
+          <label class="check"><input id="opt-facades" type="checkbox" checked /> Procedural facade fallbacks</label>
+          <div class="row">
+            <label class="field">
+              <span>Metres / floor</span>
+              <input id="meters-per-floor" type="text" inputmode="decimal" autocomplete="off" value="3.5" />
+            </label>
+            <label class="field">
+              <span>Default height (m)</span>
+              <input id="default-height" type="text" inputmode="decimal" autocomplete="off" value="10.5" />
+            </label>
+          </div>
+          <div class="row">
+            <label class="field">
+              <span>Tile size (m)</span>
+              <input id="tile-size" type="text" inputmode="decimal" autocomplete="off" value="500" />
+            </label>
+            <label class="field">
+              <span>Workers (0 = auto)</span>
+              <input id="workers" type="text" inputmode="numeric" autocomplete="off" value="0" />
+            </label>
+          </div>
+          <div class="row">
+            <label class="field">
+              <span>Max voxels (M, advanced) <i id="max-voxels-hint" class="ram-hint"></i></span>
+              <input id="max-voxels" type="text" inputmode="decimal" autocomplete="off" value="50" />
+            </label>
+          </div>
+          <div id="params-error" class="field-error" role="alert"></div>
+          <div class="row buttons" id="gen-row">
+            <button id="btn-generate" class="primary" disabled>Generate</button>
+            <button id="btn-cancel" disabled>Cancel</button>
+          </div>
+          <div id="gen-reason" class="muted reason"></div>
+          <div class="progress" id="progress-wrap">
+            <div class="progress-head">
+              <span id="progress-state" class="muted">Idle</span>
+              <span id="progress-elapsed" class="muted"></span>
+            </div>
+            <div class="bar" id="progress-barwrap"><div id="progress-bar"></div></div>
+            <div id="progress-text" class="muted"></div>
+          </div>
+          <div id="stats" class="muted"></div>
+        </section>
+
+        <section class="panel">
+          <h2>Export</h2>
+          <div class="row buttons">
+            <button id="export-vox" disabled>.vox</button>
+            <button id="export-schem" disabled>.schem</button>
+            <button id="export-json" disabled>.json</button>
+          </div>
+          <div id="export-status" class="muted"></div>
+        </section>
+
+        <section class="panel grow">
+          <h2>Warnings &amp; log</h2>
+          <div id="log" class="log"></div>
+        </section>
+      </aside>
+
+      <main id="main">
+        <nav class="tabs">
+          <button class="tab active" data-tab="map">Map</button>
+          <button class="tab" data-tab="preview">3D Preview</button>
+        </nav>
+        <section id="tab-map" class="tabpane active"><div id="map"></div></section>
+        <section id="tab-preview" class="tabpane">
+          <div id="preview-container"></div>
+          <label id="ao-toggle" title="Bake ambient occlusion into the voxels (O)"><input type="checkbox" id="ao-check" disabled /> Ambient occlusion</label>
+          <aside id="building-panel" hidden></aside>
+          <div id="preview-empty" class="empty">Generate a world to see the preview.</div>
+          <div id="preview-failed" class="empty" hidden>
+            <div class="failbox">
+              <div id="preview-failed-msg">Preview failed.</div>
+              <button id="preview-reload" class="primary">Reload preview</button>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

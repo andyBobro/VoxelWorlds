@@ -1,0 +1,10 @@
+node_modules
+out
+release
+.cache
+build/python-runtime
+build/icon.iconset
+python/.venv
+__pycache__
+.DS_Store
+screenshots
