@@ -115,7 +115,7 @@ jobs:
         run: npm run build:mac -- "-c.extraMetadata.version=$VERSION"
       - name: Verify artifact names
         run: |
-          for f in "VoxelWorlds-$VERSION-arm64-mac.zip" "VoxelWorlds-$VERSION-arm64.dmg"; do
+          for f in "VoxelWorlds-$VERSION-arm64.zip" "VoxelWorlds-$VERSION-arm64.dmg"; do
             test -f "release/$f" || { echo "missing release/$f"; ls -la release; exit 1; }
           done
       - name: Smoke test bundled Python
@@ -128,7 +128,7 @@ jobs:
         with:
           name: mac-arm64
           path: |
-            release/VoxelWorlds-${{ env.VERSION }}-arm64-mac.zip
+            release/VoxelWorlds-${{ env.VERSION }}-arm64.zip
             release/VoxelWorlds-${{ env.VERSION }}-arm64.dmg
           if-no-files-found: error
           retention-days: 7
