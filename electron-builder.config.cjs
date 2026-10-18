@@ -3,6 +3,10 @@
 const hasCert = !!(process.env.CSC_LINK || process.env.CSC_NAME);
 const notarize = !!(process.env.APPLE_ID && process.env.APPLE_APP_SPECIFIC_PASSWORD && process.env.APPLE_TEAM_ID);
 
+// A native Windows host always builds the Windows runtime; elsewhere VOXEL_BUNDLE_TARGET=win selects it (cross-build).
+const winNative = process.platform === 'win32';
+const winTarget = winNative || process.env.VOXEL_BUNDLE_TARGET === 'win';
+
 module.exports = {
   appId: 'app.voxelworlds.desktop',
   productName: 'VoxelWorlds',
@@ -12,7 +16,7 @@ module.exports = {
   extraResources: [
     { from: 'python/voxelworlds', to: 'python/voxelworlds', filter: ['**/*', '!**/__pycache__/**', '!**/*.pyc'] },
     // VOXEL_BUNDLE_TARGET=win selects the Windows runtime built by scripts/bundle-python.mjs
-    { from: process.env.VOXEL_BUNDLE_TARGET === 'win' ? 'build/python-runtime-win' : 'build/python-runtime', to: 'python-runtime' },
+    { from: winTarget ?'build/python-runtime-win' : 'build/python-runtime', to: 'python-runtime' },
   ],
   mac: {
     category: 'public.app-category.graphics-design',
@@ -30,7 +34,8 @@ module.exports = {
   win: {
     icon: 'build/icon.png',
     target: [{ target: 'nsis', arch: ['x64'] }, { target: 'zip', arch: ['x64'] }],
-    signAndEditExecutable: false,
+    // Cross-builds (no wine) cannot edit the exe; native Windows builds embed icon + version metadata (still unsigned without a cert).
+    ...(winNative ? { signExecutable: !!(process.env.WIN_CSC_LINK || process.env.CSC_LINK) } : { signAndEditExecutable: false }),
   },
   nsis: { oneClick: false, perMachine: false, allowToChangeInstallationDirectory: true, artifactName: '${productName}-Setup-${version}-${arch}.${ext}' },
   artifactName: '${productName}-${version}-${arch}.${ext}',

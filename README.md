@@ -4,6 +4,17 @@ Turn any piece of the real world into a voxel world. Draw a rectangle on a map, 
 
 ![A 1.6 km² piece of Paris around the Eiffel Tower, generated at 1 m voxels](docs/images/city-fly.png)
 
+## Downloads & first run
+
+Download the latest build from the [Releases page](https://github.com/andyBobro/VoxelWorlds/releases/latest). Each release has a macOS (Apple silicon) `.dmg`/`.zip`, a Windows x64 installer and `.zip`, and a `SHA256SUMS` file. Everything needed, including Python, is bundled.
+
+The builds are not code-signed, so the OS warns on first launch:
+
+- **macOS:** drag VoxelWorlds to Applications, then right-click it and choose Open (confirm once). Or run `xattr -dr com.apple.quarantine /Applications/VoxelWorlds.app`.
+- **Windows:** on the SmartScreen dialog, click "More info", then "Run anyway".
+
+Every push to `main` publishes a new release. The version is the latest tag plus a patch bump by default. Put `#minor` or `#major` in the commit message for a bigger bump, or `[skip release]` to publish nothing.
+
 ## Features
 
 - **Map to voxels.** Pick an area on a Leaflet map and choose a voxel size from about 5 cm to several metres. Large areas are split into tiles and processed in parallel. The output is identical whatever the tile size or worker count.
@@ -70,7 +81,7 @@ Each build bundles its own Python runtime (python-build-standalone 3.10) with al
 | macOS arm64 | `npm run dist:mac` | `.dmg`, `.zip` (ad-hoc signed, not notarized) |
 | Windows x64 | `npm run dist:win` | NSIS installer, `.zip` (unsigned) |
 
-The Windows build can be cross-built from macOS. It has not been tested on Windows yet.
+The Windows build can be cross-built from macOS (`npm run dist:win`). On a Windows host, run `node scripts/bundle-python.mjs`, `npx electron-vite build` and `npx electron-builder --win --x64 --config electron-builder.config.cjs` instead; this is what the release workflow does (`.github/workflows/release.yml`).
 
 ## Data and limits
 

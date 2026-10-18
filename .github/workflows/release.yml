@@ -1,0 +1,219 @@
+name: Release
+
+# Every push to main builds macOS (arm64) + Windows (x64) and publishes a GitHub Release.
+# Version = latest vX.Y.Z tag + patch (or #minor / #major in the head commit message).
+# The first release uses the package.json version. Tags are the source of truth; nothing is committed back.
+# Add [skip release] or [skip ci] to a commit message to skip.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'screenshots/**'
+      - '.gitignore'
+      - 'LICENSE'
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+
+permissions:
+  contents: read
+
+# Runs queue (one at a time, never cancelling a release in progress). GitHub keeps at most one
+# pending run per group, so a burst of pushes may collapse into the newest one.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  FORCE_COLOR: '0'
+
+jobs:
+  version:
+    name: Compute version
+    if: >-
+      !contains(github.event.head_commit.message, '[skip ci]') &&
+      !contains(github.event.head_commit.message, '[skip release]')
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Fetch tags
+        run: git fetch --force --tags origin
+      - id: v
+        env:
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          BUMP_INPUT: ${{ inputs.bump }}
+          CHECK_REMOTE: '1'
+        run: |
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          export PKG_VERSION
+          bash scripts/next-version.sh | tee -a "$GITHUB_OUTPUT"
+
+  test:
+    name: Typecheck and tests
+    if: >-
+      !contains(github.event.head_commit.message, '[skip ci]') &&
+      !contains(github.event.head_commit.message, '[skip release]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx tsc --noEmit -p .
+      - run: npm test
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: pip
+          cache-dependency-path: python/requirements.txt
+      # Not yet proven on a Linux runner (about 1 min locally): advisory until it has run green once.
+      # Remove continue-on-error to make it a release gate.
+      - name: Python tests
+        continue-on-error: true
+        run: |
+          python -m pip install -r python/requirements.txt
+          python -m unittest discover python/tests
+
+  build-mac:
+    name: Build macOS arm64
+    needs: [version, test]
+    runs-on: macos-14
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .cache
+            build/python-runtime
+            ~/Library/Caches/electron
+            ~/Library/Caches/electron-builder
+          key: mac-arm64-v1-${{ hashFiles('python/requirements.txt', 'scripts/bundle-python.mjs') }}
+      - run: npm ci
+      # prebuild:mac (make-icon skips because build/icon.icns is committed, then bundle-python) runs automatically.
+      - name: Build
+        run: npm run build:mac -- "-c.extraMetadata.version=$VERSION"
+      - name: Verify artifact names
+        run: |
+          for f in "VoxelWorlds-$VERSION-arm64-mac.zip" "VoxelWorlds-$VERSION-arm64.dmg"; do
+            test -f "release/$f" || { echo "missing release/$f"; ls -la release; exit 1; }
+          done
+      - name: Smoke test bundled Python
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          release/mac-arm64/VoxelWorlds.app/Contents/Resources/python-runtime/bin/python3 -I -c \
+            "import osmium, shapely, pyproj, numpy, PIL, pandas, geopandas, osmnx, requests, mapbox_vector_tile; print('imports ok')"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-arm64
+          path: |
+            release/VoxelWorlds-${{ env.VERSION }}-arm64-mac.zip
+            release/VoxelWorlds-${{ env.VERSION }}-arm64.dmg
+          if-no-files-found: error
+          retention-days: 7
+
+  build-win:
+    name: Build Windows x64
+    needs: [version, test]
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .cache
+            build/python-runtime-win
+            ~/AppData/Local/electron/Cache
+            ~/AppData/Local/electron-builder/Cache
+          key: win-x64-v1-${{ hashFiles('python/requirements.txt', 'scripts/bundle-python.mjs') }}
+      - run: npm ci
+      # Native Windows host: bundle-python.mjs and electron-builder.config.cjs pick the Windows runtime automatically.
+      - name: Bundle Python runtime
+        run: node scripts/bundle-python.mjs
+      - name: Build app
+        run: npx electron-vite build
+      - name: Package
+        run: npx electron-builder --win --x64 --config electron-builder.config.cjs "-c.extraMetadata.version=$VERSION"
+      - name: Verify artifact names
+        run: |
+          for f in "VoxelWorlds-Setup-$VERSION-x64.exe" "VoxelWorlds-$VERSION-x64.zip"; do
+            test -f "release/$f" || { echo "missing release/$f"; ls -la release; exit 1; }
+          done
+      - name: Smoke test bundled Python
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          release/win-unpacked/resources/python-runtime/python.exe -I -c \
+            "import osmium, shapely, pyproj, numpy, PIL, pandas, geopandas, osmnx, requests, mapbox_vector_tile; print('imports ok')"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: win-x64
+          path: |
+            release/VoxelWorlds-Setup-${{ env.VERSION }}-x64.exe
+            release/VoxelWorlds-${{ env.VERSION }}-x64.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: [version, build-mac, build-win]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      TAG: ${{ needs.version.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          ls -la
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+      - name: Create release
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists" >&2
+            exit 1
+          fi
+          gh release create "$TAG" dist/* \
+            --target "$GITHUB_SHA" \
+            --title "VoxelWorlds $VERSION" \
+            --generate-notes \
+            --latest

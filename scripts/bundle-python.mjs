@@ -15,7 +15,9 @@ const ASSETS = {
   x64: { triple: 'x86_64-apple-darwin', sha256: '95a2d794b8981723095190fa94b574ceb4272bb49d83b9e418bb90341e304d09' },
 };
 // VOXEL_BUNDLE_TARGET=win cross-builds the Windows x64 runtime (from macOS/Linux) into build/python-runtime-win.
-const WIN = process.env.VOXEL_BUNDLE_TARGET === 'win';
+// On a native Windows host the Windows runtime is always built (pip runs inside the extracted runtime).
+const WIN_HOST = process.platform === 'win32';
+const WIN = WIN_HOST || process.env.VOXEL_BUNDLE_TARGET === 'win';
 if (WIN) ASSETS.winx64 = { triple: 'x86_64-pc-windows-msvc', sha256: '0d828683d30185ab9f1110ad2194ef384cef0533b8e0da7e03ce837548841788' };
 else if (process.platform !== 'darwin') throw new Error('bundle-python supports macOS natively; set VOXEL_BUNDLE_TARGET=win for Windows');
 const arch = WIN ? 'winx64' : process.env.VOXEL_BUNDLE_ARCH || process.arch;
@@ -62,17 +64,29 @@ rmSync(dest, { recursive: true, force: true });
 const staging = join(root, 'build', '.python-extract');
 rmSync(staging, { recursive: true, force: true });
 mkdirSync(staging, { recursive: true });
-execFileSync('tar', ['-xzf', archive, '-C', staging]); // archive top-level dir is "python"
+// archive top-level dir is "python". On Windows use the OS bsdtar: a GNU tar from Git-for-Windows on PATH
+// mis-parses "C:\..." paths as remote hosts.
+const sysTar = WIN_HOST ? join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe') : 'tar';
+execFileSync(WIN_HOST && existsSync(sysTar) ? sysTar : 'tar', ['-xzf', archive, '-C', staging]);
 renameSync(join(staging, 'python'), dest);
 rmSync(staging, { recursive: true, force: true });
 
 if (WIN) {
-  // Cross-install win_amd64 wheels into the runtime's site-packages (nothing can be executed on this host).
-  const macPy = join(root, 'build', 'python-runtime', 'bin', 'python3'); // has ssl+pip
-  const host = process.env.VOXEL_HOST_PYTHON || (existsSync(macPy) ? macPy : process.platform === 'win32' ? 'python' : 'python3');
   const site = join(dest, 'Lib', 'site-packages');
-  execFileSync(host, ['-m', 'pip', 'install', '--no-cache-dir', '--only-binary=:all:', '--platform', 'win_amd64',
-    '--python-version', '3.10', '--implementation', 'cp', '--abi', 'cp310', '--target', site, '-r', reqFile], { stdio: 'inherit' });
+  const winPy = join(dest, 'python.exe');
+  const winEnv = { ...process.env, PIP_DISABLE_PIP_VERSION_CHECK: '1', PYTHONDONTWRITEBYTECODE: '1' };
+  delete winEnv.PYTHONHOME;
+  delete winEnv.PYTHONPATH;
+  if (WIN_HOST) {
+    // Native: install straight into the extracted runtime with its own pip.
+    execFileSync(winPy, ['-I', '-m', 'pip', 'install', '--no-cache-dir', '--only-binary=:all:', '-r', reqFile], { stdio: 'inherit', env: winEnv });
+  } else {
+    // Cross: install win_amd64 wheels into the runtime's site-packages (nothing can be executed on this host).
+    const macPy = join(root, 'build', 'python-runtime', 'bin', 'python3'); // has ssl+pip
+    const host = process.env.VOXEL_HOST_PYTHON || (existsSync(macPy) ? macPy : 'python3');
+    execFileSync(host, ['-m', 'pip', 'install', '--no-cache-dir', '--only-binary=:all:', '--platform', 'win_amd64',
+      '--python-version', '3.10', '--implementation', 'cp', '--abi', 'cp310', '--target', site, '-r', reqFile], { stdio: 'inherit' });
+  }
   const kill = (p) => rmSync(p, { recursive: true, force: true });
   const sweep = (d) => {
     for (const e of readdirSync(d, { withFileTypes: true })) {
@@ -89,8 +103,16 @@ if (WIN) {
   for (const m of ['numpy', 'shapely', 'pyproj', 'PIL', 'osmium', 'pandas', 'geopandas', 'osmnx']) {
     if (!existsSync(join(site, m))) throw new Error(`wheel for ${m} missing`);
   }
+  if (WIN_HOST) {
+    execFileSync(winPy, ['-I', '-c', 'import ssl, osmnx, osmium, shapely, pyproj, numpy, PIL, mapbox_vector_tile, geopandas, pandas, requests; print("imports ok")'], { stdio: 'inherit', env: winEnv });
+    sweep(dest); // the import check may recreate caches
+  }
   writeFileSync(stamp, stampValue);
-  console.log('[bundle-python] windows runtime done:', execFileSync('du', ['-sh', dest]).toString().trim());
+  const dirSize = (d) => readdirSync(d, { withFileTypes: true }).reduce((n, e) => {
+    const p = join(d, e.name);
+    return n + (e.isSymbolicLink() ? 0 : e.isDirectory() ? dirSize(p) : statSync(p).size);
+  }, 0);
+  console.log(`[bundle-python] windows runtime done: ${(dirSize(dest) / 1048576).toFixed(1)} MB`);
   process.exit(0);
 }
 
