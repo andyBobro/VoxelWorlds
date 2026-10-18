@@ -14,8 +14,11 @@ const ASSETS = {
   arm64: { triple: 'aarch64-apple-darwin', sha256: 'f76cc83c7db16cfc8794bf6e44d834152b57d8bab4e04e823cbc59ed23ec22f8' },
   x64: { triple: 'x86_64-apple-darwin', sha256: '95a2d794b8981723095190fa94b574ceb4272bb49d83b9e418bb90341e304d09' },
 };
-if (process.platform !== 'darwin') throw new Error('bundle-python currently supports macOS only');
-const arch = process.env.VOXEL_BUNDLE_ARCH || process.arch;
+// VOXEL_BUNDLE_TARGET=win cross-builds the Windows x64 runtime (from macOS/Linux) into build/python-runtime-win.
+const WIN = process.env.VOXEL_BUNDLE_TARGET === 'win';
+if (WIN) ASSETS.winx64 = { triple: 'x86_64-pc-windows-msvc', sha256: '0d828683d30185ab9f1110ad2194ef384cef0533b8e0da7e03ce837548841788' };
+else if (process.platform !== 'darwin') throw new Error('bundle-python supports macOS natively; set VOXEL_BUNDLE_TARGET=win for Windows');
+const arch = WIN ? 'winx64' : process.env.VOXEL_BUNDLE_ARCH || process.arch;
 const asset = ASSETS[arch];
 if (!asset) throw new Error(`unsupported arch ${arch}`);
 
@@ -23,7 +26,7 @@ const name = `cpython-${VERSION}+${RELEASE}-${asset.triple}-install_only.tar.gz`
 const url = `https://github.com/astral-sh/python-build-standalone/releases/download/${RELEASE}/${encodeURIComponent(name)}`;
 const cacheDir = join(root, '.cache');
 const archive = join(cacheDir, name);
-const dest = join(root, 'build', 'python-runtime');
+const dest = join(root, 'build', WIN ? 'python-runtime-win' : 'python-runtime');
 const stamp = join(dest, '.bundle-stamp');
 const reqFile = join(root, 'python', 'requirements.txt');
 const stampValue = `${name}\n${createHash('sha256').update(readFileSync(reqFile)).digest('hex')}\n`;
@@ -62,6 +65,34 @@ mkdirSync(staging, { recursive: true });
 execFileSync('tar', ['-xzf', archive, '-C', staging]); // archive top-level dir is "python"
 renameSync(join(staging, 'python'), dest);
 rmSync(staging, { recursive: true, force: true });
+
+if (WIN) {
+  // Cross-install win_amd64 wheels into the runtime's site-packages (nothing can be executed on this host).
+  const macPy = join(root, 'build', 'python-runtime', 'bin', 'python3'); // has ssl+pip
+  const host = process.env.VOXEL_HOST_PYTHON || (existsSync(macPy) ? macPy : process.platform === 'win32' ? 'python' : 'python3');
+  const site = join(dest, 'Lib', 'site-packages');
+  execFileSync(host, ['-m', 'pip', 'install', '--no-cache-dir', '--only-binary=:all:', '--platform', 'win_amd64',
+    '--python-version', '3.10', '--implementation', 'cp', '--abi', 'cp310', '--target', site, '-r', reqFile], { stdio: 'inherit' });
+  const kill = (p) => rmSync(p, { recursive: true, force: true });
+  const sweep = (d) => {
+    for (const e of readdirSync(d, { withFileTypes: true })) {
+      const p = join(d, e.name);
+      if (e.isSymbolicLink() || !e.isDirectory()) continue;
+      if (e.name === '__pycache__' || e.name === 'tests' || (e.name === 'test' && p.includes('site-packages'))) { kill(p); continue; }
+      sweep(p);
+    }
+  };
+  for (const p of [join(dest, 'Lib', 'test'), join(dest, 'Lib', 'idlelib'), join(dest, 'Lib', 'turtledemo'), join(dest, 'include'), join(dest, 'Scripts'), join(dest, 'tcl'), join(dest, 'libs')]) kill(p);
+  sweep(dest);
+  for (const f of readdirSync(dest)) if (f.endsWith('.pdb')) kill(join(dest, f));
+  if (!existsSync(join(dest, 'python.exe'))) throw new Error('python.exe missing in runtime');
+  for (const m of ['numpy', 'shapely', 'pyproj', 'PIL', 'osmium', 'pandas', 'geopandas', 'osmnx']) {
+    if (!existsSync(join(site, m))) throw new Error(`wheel for ${m} missing`);
+  }
+  writeFileSync(stamp, stampValue);
+  console.log('[bundle-python] windows runtime done:', execFileSync('du', ['-sh', dest]).toString().trim());
+  process.exit(0);
+}
 
 const py = join(dest, 'bin', 'python3');
 const env = { ...process.env, PYTHONHOME: '', PYTHONPATH: '', PIP_DISABLE_PIP_VERSION_CHECK: '1', PYTHONDONTWRITEBYTECODE: '1' };

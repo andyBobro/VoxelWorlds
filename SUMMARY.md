@@ -189,3 +189,7 @@ Out of scope v1: photos of roofs, curved walls, multi-building photos, furnished
 3. Measure real FPS in the preview on large scenes; add worker meshing/LOD if <60 FPS.
 4. Test Mapillary path with a real token; hilly-terrain elevation; open exports in MagicaVoxel / Minecraft (WorldEdit).
 5. Possible features: gable/hip roofs, building holes/courtyards, trees/vegetation voxels, dense-free `.schem`.
+
+## Windows 11 x64 build (2026-10-18)
+- `npm run build:win` (cross-builds from macOS): bundles python-build-standalone 3.10.20 win x64 + win_amd64 wheels into `build/python-runtime-win` (via the mac runtime's pip), then electron-builder → `release/VoxelWorlds-Setup-0.1.0-x64.exe` (NSIS, 172 MB) and `release/VoxelWorlds-0.1.0-x64.zip`.
+- UNTESTED on Windows: nothing could be executed on the build host. Unsigned (SmartScreen warning); exe icon/metadata not embedded (needs wine or a Windows host: drop `signAndEditExecutable: false`). First thing to check on Windows: python starts, generate (pbf + Overpass), worlds library, geodata download, quit leaves no python.exe.
