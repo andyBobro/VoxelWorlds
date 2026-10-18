@@ -1,8 +1,13 @@
 import type { BuildingInfo } from '../../shared/contract';
 import type { HighlightSpec, PreviewHandle, SurfaceHit } from '../preview';
+import { DegradeTracker, peekVoxelCount } from '../preview/budget';
 export type { HighlightSpec, SurfaceHit };
 
-type PreviewModule = { mountPreview?: (container: HTMLElement) => PreviewHandle };
+type MountOpts = { voxels?: number; degrade?: number };
+type PreviewModule = {
+  mountPreview?: (container: HTMLElement, opts?: MountOpts) => PreviewHandle;
+  mountPreviewAsync?: (container: HTMLElement, opts?: MountOpts) => Promise<PreviewHandle>;
+};
 
 /** Lazily mounts the Three.js preview (owned by another module); degrades gracefully if absent. */
 export class PreviewHost {
@@ -15,6 +20,16 @@ export class PreviewHost {
 
   /** Called whenever the effective AO state / availability changes. */
   onAoChange: (on: boolean, enabled: boolean) => void = () => {};
+
+  /** Render-budget degradation, raised once per incident (context loss / failed creation), decays when stable. */
+  private readonly degrade = new DegradeTracker();
+  /** Bumped by dispose(): an in-flight load() that finds it changed was superseded and must not touch the host. */
+  private epoch = 0;
+  /** Forget the degradation: call when a NEW world is generated/opened (not on Reload or automatic remounts). */
+  resetDegrade(): void { this.degrade.reset(); }
+  get degradeLevel(): number { return this.degrade.level(); }
+  /** Called when the WebGL context was lost and did not recover; the owner should reload the preview. */
+  onContextLost: () => void = () => {};
 
   private pickCb: ((hit: SurfaceHit | null) => void) | null = null;
   private hl: HighlightSpec | null = null;
@@ -78,11 +93,32 @@ export class PreviewHost {
     this.onAoChange(this.ao, !this.aoLocked);
   }
 
-  async load(buf: ArrayBuffer): Promise<void> {
+  /** Resolves true when the scene is up, false when dispose() superseded this load (nothing was mounted). */
+  async load(buf: ArrayBuffer): Promise<boolean> {
+    const ep = this.epoch;
     if (!this.handle) {
       const mod = (await import('../preview')) as PreviewModule;
-      if (typeof mod.mountPreview !== 'function') throw new Error('Preview module does not export mountPreview');
-      this.handle = mod.mountPreview(this.container);
+      if (ep !== this.epoch) return false;
+      const opts: MountOpts = { voxels: peekVoxelCount(buf), degrade: this.degrade.level() };
+      let h: PreviewHandle;
+      try {
+        if (typeof mod.mountPreviewAsync === 'function') h = await mod.mountPreviewAsync(this.container, opts);
+        else if (typeof mod.mountPreview === 'function') h = mod.mountPreview(this.container, opts);
+        else throw new Error('Preview module does not export mountPreview');
+      } catch (e) {
+        if (ep === this.epoch) this.degrade.bump(); // the next Reload asks for less
+        throw e;
+      }
+      if (ep !== this.epoch) { // disposed (or superseded) while the context was being created: release it, bail quietly
+        h.dispose();
+        return false;
+      }
+      h.onContextLost = () => {
+        if (this.handle !== h) return;
+        this.degrade.bump();
+        this.onContextLost();
+      };
+      this.handle = h;
     }
     this.handle.onPick = this.pickCb;
     this.handle.load(buf);
@@ -98,9 +134,11 @@ export class PreviewHost {
     this.aoLocked = !s.available;
     this.onAoChange(this.ao, !this.aoLocked);
     this.container.querySelector('canvas')?.focus({ preventScroll: true });
+    return true;
   }
 
   dispose(): void {
+    this.epoch++;
     this.handle?.dispose();
     this.handle = null;
     this.aoLocked = true;

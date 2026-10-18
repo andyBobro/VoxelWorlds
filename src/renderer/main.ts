@@ -8,6 +8,7 @@ import { Controls } from './ui/controls';
 import { DataSourceControl } from './ui/dataSource';
 import { DetailPanel } from './ui/detailPanel';
 import { $, errorText, stripCode } from './ui/dom';
+import { RemountLimiter, friendlyPreviewError } from './preview/budget';
 import { ExportPanel } from './ui/exportPanel';
 import { LogPanel } from './ui/logPanel';
 import { PreviewHost } from './ui/previewHost';
@@ -30,6 +31,7 @@ let displayedWorldId: string | null = null;
 preview.onPick = (hit) => detailPanel.handlePick(hit);
 detailPanel.onBusy = (b) => {
   detailBusy = b;
+  if (!b) flushRecovery();
   controls.setExternalBlock(b ? 'A building detail job is running - cancel it first' : opening ? 'Opening a world...' : '');
   worldsPanel.refreshBusy();
 };
@@ -172,12 +174,15 @@ async function loadPreview(): Promise<'ok' | 'kept' | 'lost'> {
   reloadBtn.disabled = true;
   failedBox.hidden = true;
   try {
-    const buf = await window.voxel.readVwg(lastVwgPath);
+    const path = lastVwgPath;
+    const buf = await window.voxel.readVwg(path);
+    if (lastVwgPath !== path) return 'lost'; // the world was closed/deleted while its file was being read
     previewDisposed = true;
     cityBuildings = [];
     preview.setMarkers(null);
+    pendingRecovery = false; // a loss reported by the handle being replaced is moot
     preview.dispose(); // fresh scene/WebGL context on every (re)load
-    await preview.load(buf);
+    if (!(await preview.load(buf))) return 'lost'; // disposed meanwhile (world deleted): nothing mounted, nothing to report
     previewDisposed = false;
     cityShown = true;
     detailPanel.clear(); // only once the new preview is up
@@ -190,12 +195,13 @@ async function loadPreview(): Promise<'ok' | 'kept' | 'lost'> {
     const msg = errorText(e);
     if (previewDisposed) { cityShown = false; detailPanel.clear(); } // old scene is gone, selection is meaningless
     log.add(`Preview failed: ${msg}`, 'err');
-    failedMsg.textContent = `Preview failed: ${msg}`;
+    failedMsg.textContent = `Preview failed: ${friendlyPreviewError(msg, lastParams?.voxelSize)}`;
     failedBox.hidden = false;
     return previewDisposed ? 'lost' : 'kept';
   } finally {
     reloading = false;
     reloadBtn.disabled = false;
+    flushRecovery(); // the new handle may have lost its context while this load was still running
   }
 }
 
@@ -218,6 +224,43 @@ async function loadBuildingIndex(vwgPath: string): Promise<void> {
     log.add(`Building index unavailable: ${errorText(e)}`, 'warn');
   }
 }
+
+// A lost WebGL context that never came back leaves a dead canvas: remount (the host lowers the render budget first).
+// At most two automatic remounts per minute so a GPU that keeps dying ends at the Reload button, not in a loop.
+const remountLimiter = new RemountLimiter(2, 60_000);
+let pendingRecovery = false;
+const showPreviewFailed = (text: string): void => {
+  failedMsg.textContent = `Preview failed: ${text}`;
+  failedBox.hidden = false;
+};
+function recoverPreview(): void {
+  if (!remountLimiter.tryAcquire()) {
+    showPreviewFailed(friendlyPreviewError('WebGL context lost', lastParams?.voxelSize));
+    return;
+  }
+  if (preview.inDetail) {
+    detailPanel.resetAll(); // the detail scene died with the context; leave the detail view cleanly
+    toast('The 3D view was reset after a graphics error; the open building detail was closed.', 'warn', 6000);
+  }
+  log.add('WebGL context lost; remounting the preview with a lighter render budget...', 'warn');
+  void loadPreview();
+}
+/** Runs a recovery that had to wait for a load / detail job / open to finish. */
+function flushRecovery(): void {
+  if (!pendingRecovery || reloading || generating || detailBusy || opening || !lastVwgPath) return;
+  pendingRecovery = false;
+  recoverPreview();
+}
+preview.onContextLost = () => {
+  if (!lastVwgPath) return;
+  if (reloading || generating || detailBusy || opening) { // (a successful generate remounts anyway and clears this)
+    // Never race a running load/detail job: the canvas is dead, say so now and recover when the job is done.
+    pendingRecovery = true;
+    showPreviewFailed('the graphics context was lost; the preview will reload when the current job finishes (or press "Reload preview").');
+    return;
+  }
+  recoverPreview();
+};
 
 reloadBtn.addEventListener('click', () => {
   log.add('Reloading preview...');
@@ -264,6 +307,7 @@ async function generate(): Promise<void> {
       log.add(`World could not be saved: ${why}`, 'err');
     }
     tabs.show('preview'); // show first so the preview mounts into a sized container
+    preview.resetDegrade();
     const status = await loadPreview();
     if (status === 'kept') { // the old city is still on screen: keep its context (export target, details)
       lastVwgPath = before.vwg; lastIndexPath = before.idx; lastParams = before.params; lastBuildingCount = before.count; exportName = before.name;
@@ -285,6 +329,7 @@ async function generate(): Promise<void> {
     }
   } finally {
     generating = false;
+    flushRecovery();
     worldsPanel.refreshBusy();
     detailPanel.setLocked(false);
     controls.setBusy(false);
@@ -323,6 +368,7 @@ async function openWorld(meta: WorldMeta): Promise<void> {
     exportName = `voxelworld_${res.meta.bbox.latMin.toFixed(3)}_${res.meta.bbox.lonMin.toFixed(3)}`;
     displayedWorldId = res.meta.id; // the building index (context for details) is read inside loadPreview
     tabs.show('preview');
+    preview.resetDegrade(); // a different world: start from the full-quality budget for its size
     const status = await loadPreview(); // clears markers/buildings itself once the new scene is up
     if (status !== 'ok') {
       if (status === 'kept') { // old scene still on screen: restore its context
@@ -346,6 +392,7 @@ async function openWorld(meta: WorldMeta): Promise<void> {
     void session.refreshWorlds();
   } finally {
     opening = false;
+    flushRecovery();
     detailPanel.setLocked(false);
     controls.setExternalBlock(detailBusy ? 'A building detail job is running - cancel it first' : '');
     worldsPanel.refreshBusy();

@@ -7,6 +7,7 @@ import { Markers } from './markers';
 import { buildingFocus } from './markerGeometry';
 import type { BuildingInfo } from '../../shared/contract';
 import { VoxelWorld } from './world';
+import { detailGeometryBudget, planBudget, rendererAttempts, type RenderBudget, type RendererOptions } from './budget';
 
 export type { CameraMode } from './camera';
 export type { HighlightSpec } from './highlight';
@@ -44,6 +45,20 @@ export interface PreviewHandle {
   setMarkersVisible(v: boolean): void;
   /** Smoothly keeps orbit limits; moves the orbit target to the building and zooms to fit. City scene only. */
   focusBuilding(b: BuildingInfo): void;
+  /**
+   * Fires once when the WebGL context is lost and has not come back within a grace period (or never will).
+   * The owner should remount (dispose + mount + load); the canvas is dead until then.
+   */
+  onContextLost: (() => void) | null;
+  /** True when the city scene stopped meshing at the GPU memory budget (outer chunks not shown). */
+  isTruncated(): boolean;
+}
+
+export interface MountOptions {
+  /** Voxel count of the scene about to be loaded; sizes shadows/AA/pixel-ratio/GPU geometry budget. */
+  voxels?: number;
+  /** Extra tiers of degradation (after a context loss or failed creation); 0 = none. */
+  degrade?: number;
 }
 
 /** AO adds ~1.3-2x triangles; above this many voxels it defaults to off (re-enable with setAmbientOcclusion). */
@@ -95,19 +110,63 @@ function quietContextLoss(): void {
   };
 }
 
-export function mountPreview(container: HTMLElement): PreviewHandle {
+function tryCreateRenderer(o: RendererOptions): THREE.WebGLRenderer {
+  const r = new THREE.WebGLRenderer({ antialias: o.antialias, alpha: o.alpha, powerPreference: o.powerPreference, stencil: o.stencil });
+  r.setPixelRatio(o.pixelRatio);
+  return r;
+}
+
+const nextFrame = (ms: number): Promise<void> =>
+  new Promise((res) => { setTimeout(() => requestAnimationFrame(() => res()), ms); });
+
+/**
+ * Creates a renderer, retrying with progressively cheaper options (see rendererAttempts) and waiting between
+ * attempts so a stressed GPU process can release the previous context's memory. Throws the last error.
+ */
+async function createRendererRetry(budget: RenderBudget): Promise<{ renderer: THREE.WebGLRenderer; opts: RendererOptions }> {
+  const attempts = rendererAttempts(budget, window.devicePixelRatio || 1);
+  let last: unknown = null;
+  for (let i = 0; i < attempts.length; i++) {
+    try {
+      return { renderer: tryCreateRenderer(attempts[i]!), opts: attempts[i]! };
+    } catch (e) {
+      last = e;
+      console.warn(`WebGL context creation failed (attempt ${i + 1}/${attempts.length}): ${String((e as Error)?.message ?? e)}`);
+      await nextFrame(150 * (i + 1));
+    }
+  }
+  throw last instanceof Error ? last : new Error(String(last));
+}
+
+/** Async mount with a creation retry ladder; prefer this over mountPreview. */
+export async function mountPreviewAsync(container: HTMLElement, opts: MountOptions = {}): Promise<PreviewHandle> {
+  const budget = planBudget(opts.voxels ?? 0, opts.degrade ?? 0);
+  const { renderer, opts: ro } = await createRendererRetry(budget);
+  return mountWith(container, renderer, ro, budget);
+}
+
+/** Synchronous mount: walks the whole ladder back to back (no waiting between attempts; use mountPreviewAsync to wait). */
+export function mountPreview(container: HTMLElement, opts: MountOptions = {}): PreviewHandle {
+  const budget = planBudget(opts.voxels ?? 0, opts.degrade ?? 0);
+  const attempts = rendererAttempts(budget, window.devicePixelRatio || 1);
+  let last: unknown = null;
+  for (const a of attempts) {
+    try { return mountWith(container, tryCreateRenderer(a), a, budget); } catch (e) { last = e; }
+  }
+  throw last instanceof Error ? last : new Error(String(last));
+}
+
+function mountWith(container: HTMLElement, renderer: THREE.WebGLRenderer, ropts: RendererOptions, budget: RenderBudget): PreviewHandle {
   if (getComputedStyle(container).position === 'static') container.style.position = 'relative';
   container.style.overflow = 'hidden';
 
-  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: 'high-performance' });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
   // The sky is a CSS gradient behind a transparent canvas (not a scene.background texture): it cannot go black when GL
   // state/textures are lost or replaced (seen after a detail round trip), and costs no texture upload.
   renderer.setClearColor(0x000000, 0);
   const skyHex = '#' + SKY.toString(16).padStart(6, '0');
   container.style.background = `linear-gradient(to bottom, ${SKY_TOP} 0%, ${skyHex} 55%, ${skyHex} 100%)`;
   renderer.localClippingEnabled = true; // detail-scene floor cutaway (material.clippingPlanes)
-  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.enabled = ropts.shadows || ropts.detailShadows;
   renderer.shadowMap.type = THREE.PCFShadowMap;
   renderer.shadowMap.autoUpdate = false; // static scene: re-render the shadow map only while chunks are still arriving
   const canvas = renderer.domElement;
@@ -115,19 +174,20 @@ export function mountPreview(container: HTMLElement): PreviewHandle {
   canvas.tabIndex = 0;
   container.appendChild(canvas);
 
-  const makeScene = (shadowSize: number): { scene: THREE.Scene; sun: THREE.DirectionalLight } => {
+  const makeScene = (shadowSizeWanted: number, cast: boolean): { scene: THREE.Scene; sun: THREE.DirectionalLight } => {
+    const shadowSize = Math.min(shadowSizeWanted, ropts.shadowMapSize);
     const sc = new THREE.Scene();
     sc.fog = new THREE.Fog(SKY, 100, 1000);
     const hemi = new THREE.HemisphereLight(0xdfeeff, 0x6b6558, 1.1);
     const sn = new THREE.DirectionalLight(0xffffff, 2.0);
     sn.position.set(0.5, 1, 0.8);
-    sn.castShadow = true;
+    sn.castShadow = cast;
     sn.shadow.mapSize.set(shadowSize, shadowSize);
     sn.shadow.radius = 3;
     sc.add(hemi, sn, sn.target);
     return { scene: sc, sun: sn };
   };
-  const { scene: cityScene, sun: citySun } = makeScene(4096);
+  const { scene: cityScene, sun: citySun } = makeScene(4096, ropts.shadows); // size clamped to the budget's shadow map size
   let scene = cityScene; // the scene being rendered
   const sun = citySun;
 
@@ -175,8 +235,24 @@ export function mountPreview(container: HTMLElement): PreviewHandle {
   ro.observe(container);
   resize();
 
-  const onLost = (e: Event): void => e.preventDefault(); // allow restoration; three re-inits GL state
+  // preventDefault lets the browser restore the context (three re-inits GL state and re-uploads geometry). If it
+  // does not come back within the grace period the canvas stays blank, so tell the owner to remount instead.
+  let onContextLostCb: (() => void) | null = null;
+  let lostTimer: ReturnType<typeof setTimeout> | null = null;
+  const onLost = (e: Event): void => {
+    e.preventDefault();
+    if (lostTimer || disposed) return;
+    lostTimer = setTimeout(() => {
+      lostTimer = null;
+      if (!disposed) onContextLostCb?.();
+    }, 1500);
+  };
+  const onRestored = (): void => {
+    if (lostTimer) { clearTimeout(lostTimer); lostTimer = null; }
+    renderer.shadowMap.needsUpdate = true;
+  };
   canvas.addEventListener('webglcontextlost', onLost);
+  canvas.addEventListener('webglcontextrestored', onRestored);
 
   let hl: Highlight | null = null;
   let hlSpec: HighlightSpec | null = null;
@@ -235,7 +311,7 @@ export function mountPreview(container: HTMLElement): PreviewHandle {
       d.scene.remove(d.world.group);
       d.world.dispose();
       aoOn = on;
-      d.world = new VoxelWorld(d.data, d.material, aoOn);
+      d.world = new VoxelWorld(d.data, d.material, aoOn, detailGeometryBudget(budget.maxGeometryBytes, cityWorld?.stats.geometryBytes ?? 0));
       d.scene.add(d.world.group);
       renderer.shadowMap.needsUpdate = true;
       return aoOn;
@@ -250,7 +326,7 @@ export function mountPreview(container: HTMLElement): PreviewHandle {
     cityScene.remove(cityWorld.group);
     cityWorld.dispose();
     aoOn = on;
-    cityWorld = new VoxelWorld(kept, material, aoOn);
+    cityWorld = new VoxelWorld(kept, material, aoOn, budget.maxGeometryBytes, budget.maxTriangles);
     cityScene.add(cityWorld.group);
     renderer.shadowMap.needsUpdate = true;
     return aoOn;
@@ -336,6 +412,9 @@ export function mountPreview(container: HTMLElement): PreviewHandle {
         mode: rig.mode,
         ao: aoOn,
         aoToggle: detail ? true : kept !== null,
+        truncated: s?.truncated ?? false,
+        inDetail: detail !== null,
+        geoMB: s ? s.geometryBytes / 1048576 : 0,
       });
     }
   });
@@ -360,6 +439,9 @@ export function mountPreview(container: HTMLElement): PreviewHandle {
   };
 
   return {
+    get onContextLost() { return onContextLostCb; },
+    set onContextLost(cb) { onContextLostCb = cb; },
+    isTruncated: () => cityWorld?.stats.truncated ?? false,
     get onPick() { return onPickCb; },
     set onPick(cb) { onPickCb = cb; syncCrosshair(); },
 
@@ -372,7 +454,7 @@ export function mountPreview(container: HTMLElement): PreviewHandle {
       hlSpec = null;
       kept = data.x.length <= KEEP_DATA_MAX_VOXELS ? data : null;
       aoOn = userAo ?? data.x.length <= AO_AUTO_MAX_VOXELS;
-      const w = new VoxelWorld(data, material, aoOn);
+      const w = new VoxelWorld(data, material, aoOn, budget.maxGeometryBytes, budget.maxTriangles);
       cityWorld = w;
       cityScene.add(w.group);
 
@@ -432,12 +514,12 @@ export function mountPreview(container: HTMLElement): PreviewHandle {
       const data = parseVwg(buf);
       teardownDetail();
       const cam = rig.saveState();
-      const { scene: ds, sun: dsun } = makeScene(2048);
+      const { scene: ds, sun: dsun } = makeScene(2048, ropts.detailShadows);
       const mat = new THREE.MeshLambertMaterial({ vertexColors: true });
       const plane = new THREE.Plane(new THREE.Vector3(0, -1, 0), 1e9);
       mat.clippingPlanes = [plane];
       mat.clipShadows = true;
-      const world = new VoxelWorld(data, mat, userAo ?? true);
+      const world = new VoxelWorld(data, mat, userAo ?? true, detailGeometryBudget(budget.maxGeometryBytes, cityWorld.stats.geometryBytes));
       aoOn = userAo ?? true;
       ds.add(world.group);
       const d: Detail = { scene: ds, sun: dsun, material: mat, world, data, plane, cam };
@@ -487,7 +569,10 @@ export function mountPreview(container: HTMLElement): PreviewHandle {
       disposed = true;
       renderer.setAnimationLoop(null);
       ro.disconnect();
+      if (lostTimer) { clearTimeout(lostTimer); lostTimer = null; }
+      onContextLostCb = null;
       canvas.removeEventListener('webglcontextlost', onLost);
+      canvas.removeEventListener('webglcontextrestored', onRestored);
       canvas.removeEventListener('keydown', onKey);
       canvas.removeEventListener('pointerdown', onDown);
       canvas.removeEventListener('pointerup', onUp);
@@ -501,9 +586,12 @@ export function mountPreview(container: HTMLElement): PreviewHandle {
       citySun.shadow.map = null;
       material.dispose();
       container.style.background = '';
+      cityScene.clear();
+      renderer.renderLists.dispose();
       renderer.dispose();
       quietContextLoss();
       renderer.forceContextLoss(); // release the GL context now; a new renderer is created on every (re)load
+      canvas.width = canvas.height = 1; // drop the drawable backing store immediately, not at GC time
       canvas.remove();
     },
   };
