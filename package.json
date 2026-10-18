@@ -9,10 +9,10 @@
     "build": "electron-vite build",
     "start": "electron-vite preview",
     "prebuild:mac": "node scripts/make-icon.mjs && node scripts/bundle-python.mjs",
-    "build:mac": "electron-vite build && electron-builder --mac --config electron-builder.config.cjs",
+    "build:mac": "electron-vite build && electron-builder --mac --publish never --config electron-builder.config.cjs",
     "dist:mac": "npm run build:mac",
     "bundle-python:win": "VOXEL_BUNDLE_TARGET=win node scripts/bundle-python.mjs",
-    "build:win": "npm run bundle-python:win && electron-vite build && VOXEL_BUNDLE_TARGET=win electron-builder --win --x64 --config electron-builder.config.cjs",
+    "build:win": "npm run bundle-python:win && electron-vite build && VOXEL_BUNDLE_TARGET=win electron-builder --win --x64 --publish never --config electron-builder.config.cjs",
     "dist:win": "npm run build:win",
     "test": "vitest run"
   },

@@ -112,7 +112,7 @@ jobs:
       - run: npm ci
       # prebuild:mac (make-icon skips because build/icon.icns is committed, then bundle-python) runs automatically.
       - name: Build
-        run: npm run build:mac -- "-c.extraMetadata.version=$VERSION"
+        run: npm run build:mac -- --publish never "-c.extraMetadata.version=$VERSION"
       - name: Verify artifact names
         run: |
           for f in "VoxelWorlds-$VERSION-arm64-mac.zip" "VoxelWorlds-$VERSION-arm64.dmg"; do
@@ -163,7 +163,7 @@ jobs:
       - name: Build app
         run: npx electron-vite build
       - name: Package
-        run: npx electron-builder --win --x64 --config electron-builder.config.cjs "-c.extraMetadata.version=$VERSION"
+        run: npx electron-builder --win --x64 --publish never --config electron-builder.config.cjs "-c.extraMetadata.version=$VERSION"
       - name: Verify artifact names
         run: |
           for f in "VoxelWorlds-Setup-$VERSION-x64.exe" "VoxelWorlds-$VERSION-x64.zip"; do
