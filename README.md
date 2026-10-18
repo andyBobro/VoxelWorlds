@@ -13,6 +13,24 @@ The builds are not code-signed, so the OS warns on first launch:
 - **macOS:** drag VoxelWorlds to Applications, then right-click it and choose Open (confirm once). Or run `xattr -dr com.apple.quarantine /Applications/VoxelWorlds.app`.
 - **Windows:** on the SmartScreen dialog, click "More info", then "Run anyway".
 
+### Offline generation on Windows
+
+Offline mode builds worlds from a [Geofabrik](https://download.geofabrik.de/) `.osm.pbf` extract stored on your PC. The app needs the internet only once, to download the extract. After that, generating works without a connection.
+
+1. Install and start the app (SmartScreen steps above). No Python or other software is needed.
+2. In the left panel, under **Data source**, choose **Local Geofabrik extract (offline)**.
+3. Click **Choose region...** and pick a region that covers your area (the list shows covering regions first, smallest first). Smaller extracts are faster: a country extract can be hundreds of MB, and a continent several GB.
+4. Click **Download** and wait until it finishes. A cancelled download resumes where it stopped. The file is checked against Geofabrik's checksum.
+5. Click **Use this region**, draw your rectangle on the map and press **Generate**. You can now disconnect from the internet.
+
+Good to know:
+- **The map tiles still need the internet.** The Leaflet map shows OpenStreetMap tiles online. Without a connection the map background stays blank, and you can still draw the rectangle if you know where it is, but it is much easier to place it while connected. Generation itself does not use the network.
+- **Elevation and Mapillary** also use the internet. Untick **Elevation** and leave the Mapillary token empty to stay fully offline.
+- **First use of a large extract (about 50 MB or more) builds an index**, which takes a few minutes and needs about as much extra disk space as the extract. Later runs are fast.
+- **Where files are stored:** `%APPDATA%\voxelworlds\geodata` (extracts) and `%APPDATA%\voxelworlds\worlds` (saved worlds). Delete extracts you no longer need from the app's region picker.
+- Make sure the drive has enough free space, and that antivirus software does not block the app from writing to `%APPDATA%`.
+- Windows support is new and has been tested only on GitHub's build machines, not on real PCs yet. Please report problems on the [issues page](https://github.com/andyBobro/VoxelWorlds/issues).
+
 Every push to `main` publishes a new release. The version is the latest tag plus a patch bump by default. Put `#minor` or `#major` in the commit message for a bigger bump, or `[skip release]` to publish nothing.
 
 ## Features
