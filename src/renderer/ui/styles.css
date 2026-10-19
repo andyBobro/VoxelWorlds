@@ -268,3 +268,13 @@ button.danger:hover:not(:disabled) { background: rgba(239,83,80,.28); border-col
 .wl-meta { margin: 0 0 3px; }
 .wl-stats { margin-bottom: 2px; }
 .wl-details { margin-top: 6px; padding-top: 6px; }
+
+/* map "Show my location" control + marker */
+.leaflet-control-locate a.locate-btn { display: flex; align-items: center; justify-content: center; width: 30px; height: 30px; color: #333; }
+.leaflet-control-locate a.locate-btn.leaflet-disabled { cursor: default; color: #aaa; background: #f4f4f4; }
+.leaflet-control-locate a.locate-btn.locating svg { animation: locate-spin 1s linear infinite; }
+.leaflet-control-locate a.locate-btn[data-state="success"] { color: #1a73e8; }
+.map-locked .leaflet-control-locate a.locate-btn { pointer-events: none; }
+@keyframes locate-spin { to { transform: rotate(360deg); } }
+.locate-dot-wrap { background: none; border: 0; }
+.locate-dot { width: 18px; height: 18px; box-sizing: border-box; border-radius: 50%; background: #1a73e8; border: 3px solid #fff; box-shadow: 0 0 0 1px rgba(0,0,0,.25), 0 1px 4px rgba(0,0,0,.4); }

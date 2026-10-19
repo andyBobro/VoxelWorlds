@@ -36,6 +36,7 @@ Every push to `main` publishes a new release. The version is the latest tag plus
 ## Features
 
 - **Map to voxels.** Pick an area on a Leaflet map and choose a voxel size from about 5 cm to several metres. Large areas are split into tiles and processed in parallel. The output is identical whatever the tile size or worker count.
+- **Locate me.** The crosshair button under the map's zoom/draw controls centres the map on where you are. It uses the operating system's location service, so location access must be allowed for VoxelWorlds (macOS: System Settings > Privacy & Security > Location Services; Windows: Settings > Privacy & security > Location). The position is never sent anywhere by the app and there is no IP-geolocation fallback. Without permission, offline, or on Linux/dev builds without a location provider it shows a short message and the map keeps working.
 - **Realistic buildings.** Roofs (gabled, hipped, mansard, dome and others), levels, materials and colours come from OSM tags. Where tags are missing, buildings get procedural defaults.
 - **Landscape.** Elevation, water, roads, parks, trees and land cover. Optional Mapillary imagery is used to sample facade colours.
 - **Photo facades.** Upload a photo of one wall of a building and mark its four corners. Classical computer vision (no ML models, no cloud) finds the windows, doors and colours and repaints that wall.

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { GRAVITY, HEIGHT, HALF_W, Mover, scaleFromCityVoxel, type CollisionWorld, type MoveInput } from '../src/renderer/walk/physics';
+import { GRAVITY, HEIGHT, HALF_W, JUMP_APEX_M, Mover, scaleFromCityVoxel, type CollisionWorld, type MoveInput } from '../src/renderer/walk/physics';
 
 /** Flat ground (y < 0 solid) over a 400 x 400 voxel area plus arbitrary extra solids. */
 function world(vs: number, extra: (x: number, y: number, z: number) => boolean = () => false, half = 200): CollisionWorld {
@@ -27,16 +27,18 @@ const walk = (m: Mover, inp: MoveInput, secs: number, dt = 1 / 60): void => {
 };
 
 describe('scaleFromCityVoxel', () => {
-  it('clamps outdoor step height to [0.25, 2.0] m, caps the indoor step at 0.35 m and jumps 2.2x the outdoor step', () => {
+  it('clamps outdoor step height to [0.25, 2.0] m, caps the indoor step at 0.35 m and jumps a constant 0.5 m', () => {
     expect(scaleFromCityVoxel(0.1).stepUp).toBe(0.25);
     expect(scaleFromCityVoxel(0.5).stepUp).toBe(0.5);
     expect(scaleFromCityVoxel(2).stepUp).toBe(2);
     expect(scaleFromCityVoxel(5).stepUp).toBe(2);
     expect(scaleFromCityVoxel(1).indoorStepUp).toBe(0.35);
     expect(scaleFromCityVoxel(0.25).indoorStepUp).toBe(0.25);
-    expect(scaleFromCityVoxel(1).jumpHeight).toBeCloseTo(2.2);
+    expect(scaleFromCityVoxel(1).jumpHeight).toBeCloseTo(0.5);
+    expect(scaleFromCityVoxel(0.1).jumpHeight).toBeCloseTo(0.5);
+    expect(scaleFromCityVoxel(5).jumpHeight).toBeCloseTo(0.5);
     const s = scaleFromCityVoxel(0.5);
-    expect(s.jumpHeight).toBeCloseTo(1.1);
+    expect(s.jumpHeight).toBeCloseTo(0.5);
     expect(s.jumpSpeed ** 2 / (2 * GRAVITY)).toBeCloseTo(s.jumpHeight);
   });
 });
@@ -129,13 +131,13 @@ describe('indoor step cap', () => {
     expect(inn.p[1]).toBeCloseTo(0, 5);
     expect(inn.p[0]).toBeLessThan(1.5);
   });
-  it('indoor jump apex is still 2.2 * outdoor stepUp', () => {
+  it('indoor jump apex is also 0.5 m', () => {
     const m = mover(0.15, undefined, 1.0);
     m.indoor = true;
     let max = 0;
     m.step(1 / 120, { ...IDLE, jump: true });
     for (let i = 0; i < 400; i++) { m.step(1 / 120, IDLE); max = Math.max(max, m.p[1]!); }
-    expect(max).toBeCloseTo(2.2, 1);
+    expect(Math.abs(max - 0.5)).toBeLessThanOrEqual(0.02);
   });
 });
 
@@ -212,8 +214,8 @@ describe('jump', () => {
     for (let i = 0; i < 240; i++) { m.step(1 / 120, IDLE); max = Math.max(max, m.p[1]!); }
     return max;
   }
-  it('apex is 2.2 stepUp', () => {
-    for (const vs of [0.25, 0.5, 1]) expect(peak(vs)).toBeCloseTo(2.2 * scaleFromCityVoxel(vs).stepUp, 1);
+  it('apex is 0.5 m +-0.02 for every voxel size', () => {
+    for (const vs of [0.1, 0.25, 0.5, 1, 2]) expect(Math.abs(peak(vs) - 0.5)).toBeLessThanOrEqual(0.02);
   });
   it('lands again', () => {
     const m = mover(0.5);
@@ -227,26 +229,43 @@ describe('jump', () => {
     m.step(1 / 60, { ...IDLE, jump: true });
     for (let i = 0; i < 12; i++) m.step(1 / 60, { ...IDLE, jump: true });
     const h = m.p[1]!;
-    expect(h).toBeLessThan(2.2 * 0.5 + 1e-3);
+    expect(h).toBeLessThan(0.5 + 1e-3);
   });
 
-  // ledge of N voxels (vs 0.5, stepUp 0.5, apex 1.1 m): 2 voxels (1.0 m) climbable by jumping, 3 (1.5 m) not
-  const ledge = (n: number) => (x: number, y: number) => x >= 4 && y < n;
+  // vs 0.05 world (stepUp forced to 0.25 m would auto-take it, so use a scale with stepUp 0.1): an obstacle taller than
+  // the auto step can only be cleared by the 0.5 m jump (auto step is off in the air)
+  const sc = { stepUp: 0.1, jumpHeight: JUMP_APEX_M, jumpSpeed: Math.sqrt(2 * GRAVITY * JUMP_APEX_M) };
   function tryClimb(n: number): Mover {
-    const m = mover(0.5, ledge(n));
+    const m = new Mover(world(0.05, (x, y) => x >= 40 && y < n), sc);
+    m.teleport(1.0, 0, 0.025); settle(m);
     m.step(1 / 60, { ...FWD, jump: true });
     walk(m, FWD, 1.6);
     return m;
   }
-  it('clears a 2-voxel ledge', () => {
-    const m = tryClimb(2);
-    expect(m.p[1]).toBeCloseTo(1.0, 5);
-    expect(m.p[0]).toBeGreaterThan(2.2);
+  it('walking alone does not take a 0.45 m obstacle (above auto step)', () => {
+    const m = new Mover(world(0.05, (x, y) => x >= 40 && y < 9), sc);
+    m.teleport(1.0, 0, 0.025); settle(m);
+    walk(m, FWD, 1.6);
+    expect(m.p[1]).toBeCloseTo(0, 5);
   });
-  it('does not clear a 3-voxel ledge', () => {
-    const m = tryClimb(3);
+  it('jump clears a 0.45 m obstacle', () => {
+    const m = tryClimb(9);
+    expect(m.p[1]).toBeCloseTo(0.45, 5);
+    expect(m.p[0]).toBeGreaterThan(2.1);
+  });
+  it('jump does not clear a 0.6 m obstacle', () => {
+    const m = tryClimb(12);
     expect(m.p[1]).toBeCloseTo(0, 5);
     expect(m.p[0]).toBeLessThan(2.0);
+  });
+  it('jumps onto a 0.4 m indoor bench', () => {
+    const m = new Mover(world(0.1, (x, y) => x >= 15 && y < 4), scaleFromCityVoxel(1));
+    m.indoor = true;
+    m.teleport(1.0, 0, 0.05); settle(m);
+    m.step(1 / 60, { ...FWD, jump: true });
+    walk(m, FWD, 1.6);
+    expect(m.p[1]).toBeCloseTo(0.4, 5);
+    expect(m.p[0]).toBeGreaterThan(1.8);
   });
 });
 
@@ -364,7 +383,7 @@ describe('disc body (diameter 0.6 m)', () => {
     expect(m.p[0]!).toBeLessThan(2.0);
   });
 
-  it('outdoors with 1 m voxels: 1-voxel step, 2-voxel jump, walls block', () => {
+  it('outdoors with 1 m voxels: 1-voxel step, 2-voxel ledge and up block (jump is 0.5 m)', () => {
     const step1 = mover(1, (x, y) => x >= 3 && y < 1);
     walk(step1, FWD, 2);
     expect(step1.p[0]!).toBeGreaterThan(4); expect(step1.p[1]!).toBeCloseTo(1, 5);
@@ -374,7 +393,8 @@ describe('disc body (diameter 0.6 m)', () => {
     const jump = mover(1, (x, y) => x >= 3 && y < 2);
     jump.step(1 / 60, { ...FWD, jump: true });
     walk(jump, FWD, 2.5);
-    expect(jump.p[1]!).toBeCloseTo(2, 5);
+    expect(jump.p[0]!).toBeCloseTo(3 - 0.3, 4);
+    expect(jump.p[1]!).toBeCloseTo(0, 5);
     const wall3 = mover(1, (x, y) => x >= 3 && y < 3);
     wall3.step(1 / 60, { ...FWD, jump: true });
     walk(wall3, FWD, 2.5);

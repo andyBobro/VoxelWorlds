@@ -6,7 +6,8 @@
  *                                                      max 2 m so huge voxels do not make the player a giant)
  *   indoorStepUp = min(stepUp, 0.35) m                 inside buildings (0.15-0.25 m voxels): stairs and thresholds only,
  *                                                      not 1 m furniture
- *   jumpHeight   = 2.2 * stepUp (outdoor value, also indoors) so a 2-voxel city ledge is climbable and a 3-voxel one is not.
+ *   jumpHeight   = JUMP_APEX_M = 0.5 m, constant (user decision), independent of the city voxel size, indoors and outdoors.
+ *                  Auto step-up is disabled in the air, so a jump clears obstacles up to ~0.5 m (not more).
  * Gravity is 20 m/s^2; the take-off speed follows from the apex: v = sqrt(2 g h).
  *
  * Collision body: a 1.8 m tall cylinder, 0.6 m in diameter (a disc in plan). Horizontal motion is a swept circle against
@@ -27,6 +28,8 @@ export const HALF_W = RADIUS;
 export const HEIGHT = 1.8;
 export const EYE_HEIGHT = 1.6;
 export const GRAVITY = 20;
+/** Jump apex (feet rise) in metres; take-off speed v = sqrt(2 g h) = 4.47 m/s. */
+export const JUMP_APEX_M = 0.5;
 const EPS = 1e-6;
 const COYOTE = 0.1;
 
@@ -42,7 +45,7 @@ export interface Scale {
 export function scaleFromCityVoxel(cityVs: number): Scale {
   const s = Number.isFinite(cityVs) && cityVs > 0 ? cityVs : 1;
   const stepUp = Math.min(2.0, Math.max(0.25, s));
-  const jumpHeight = 2.2 * stepUp;
+  const jumpHeight = JUMP_APEX_M;
   return { stepUp, indoorStepUp: Math.min(stepUp, 0.35), jumpHeight, jumpSpeed: Math.sqrt(2 * GRAVITY * jumpHeight) };
 }
 

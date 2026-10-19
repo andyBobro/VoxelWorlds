@@ -1,6 +1,7 @@
 import { app, BrowserWindow, session, shell } from 'electron';
 import { join } from 'node:path';
 import { buildCsp } from './csp';
+import { decidePermission } from './permissions';
 import type { WalkSession } from '../shared/contract';
 import { registerIpc, type IpcHandle } from './ipc';
 import type { WalkWindowHandle } from './walk';
@@ -141,10 +142,17 @@ if (!locked) {
 
   void app.whenReady().then(() => {
     const ses = session.defaultSession;
-    // Everything denied, except what the walking window (first-person view) needs: mouse look and fullscreen.
-    ses.setPermissionRequestHandler((wc, perm, cb) => {
-      cb((perm === 'pointerLock' || perm === 'fullscreen') && !!ipc?.isWalkSender(wc.id));
+    // Everything denied, except: mouse look + fullscreen for the walking window, and geolocation ("Locate me" on the map)
+    // for the main window only. Position comes from the OS location provider; there is no IP-geolocation fallback.
+    const decide = (wc: Electron.WebContents | null, permission: string, url: string | undefined, isMainFrame?: boolean): boolean =>
+      !!wc && decidePermission({
+        permission, wcId: wc.id, mainWcId: mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents.id : undefined,
+        isWalkSender: !!ipc?.isWalkSender(wc.id), url, devUrl: isDev ? process.env.ELECTRON_RENDERER_URL : undefined, isMainFrame,
+      });
+    ses.setPermissionRequestHandler((wc, perm, cb, details) => {
+      cb(decide(wc, perm, details.requestingUrl, details.isMainFrame));
     });
+    ses.setPermissionCheckHandler((wc, perm, origin, details) => decide(wc, perm, details.requestingUrl || origin, details.isMainFrame));
     ses.webRequest.onHeadersReceived((details, cb) => {
       cb({ responseHeaders: { ...details.responseHeaders, 'Content-Security-Policy': [buildCsp({ dev: isDev })] } });
     });
