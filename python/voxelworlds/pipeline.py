@@ -352,7 +352,12 @@ def _generate(job, prog, p, cfg, t0, bbox, vs, feats, mpf, def_h, max_vox, token
     try:  # building index sidecar next to the .vwg (vw-xxx.buildings.json); never fails the run
         from .voxel import bindex
         ipath = os.path.splitext(path)[0] + ".buildings.json"
-        bindex.write_index(ipath, bindex.build_index(bidx_records, buildings, grid, terrain, mpf))
+        bidx = bindex.build_index(bidx_records, buildings, grid, terrain, mpf)
+        bindex.write_index(ipath, bidx)
+        try:        # lets a later detail request place its walking entrances in this city grid
+            bindex.remember_city(bbox, vs, bidx)
+        except Exception as e:
+            log(f"city info cache failed: {type(e).__name__}: {e}")
         stats_out_extra = {"buildingIndexPath": ipath}
     except Exception as e:
         log(f"building index failed: {type(e).__name__}: {e}")

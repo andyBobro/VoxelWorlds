@@ -100,6 +100,7 @@
         <section id="tab-map" class="tabpane active"><div id="map"></div></section>
         <section id="tab-preview" class="tabpane">
           <div id="preview-container"></div>
+          <button id="walk-here" type="button" title="Walk through this world in a new window, starting at the view's ground position" disabled>Walk here</button>
           <label id="ao-toggle" title="Bake ambient occlusion into the voxels (O)"><input type="checkbox" id="ao-check" disabled /> Ambient occlusion</label>
           <label id="marker-toggle" title="Show markers on buildings that have saved details" hidden>
             <input type="checkbox" id="marker-check" checked /> <i class="mk-swatch"></i> <span id="marker-count"></span>
@@ -115,6 +116,16 @@
         </section>
         <section id="tab-worlds" class="tabpane"><div id="worlds-root" class="worlds-root"></div></section>
       </main>
+    </div>
+    <div id="walk-lock" role="alertdialog" aria-modal="true" aria-labelledby="walk-lock-title" hidden>
+      <div class="walk-lock-box">
+        <h2 id="walk-lock-title">Walking view is open &mdash; close it to continue</h2>
+        <p class="muted">The map, generation, worlds and exports are paused until you leave the walking view.</p>
+        <div class="row buttons">
+          <button id="walk-lock-focus" class="primary" type="button">Return to walking window</button>
+          <button id="walk-lock-exit" type="button">Exit walking</button>
+        </div>
+      </div>
     </div>
     <script type="module" src="./main.ts"></script>
   </body>

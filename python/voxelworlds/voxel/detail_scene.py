@@ -4,6 +4,11 @@ Reuses the city code paths (extract_buildings -> voxelize_building -> facade.bui
 details.apply_details) so the building looks like in the city view, only finer. Optionally repaints one wall from
 a FacadeSpec (voxel/facade_paint.py) and calls the interior hook (voxel/interior.py::build_interior).
 
+With an interior the result stats also carry ``entrances`` (walking demo, contract WalkEntrance): the interior
+builder yields the detail-frame positions, ``_map_entrances`` adds edge / city cell / cityDir. The city frame comes
+from ``ref.cityVoxelSize`` / ``ref.cityBaseY`` (optional, from the host) or the generate run's cache
+(bindex.remember_city); without it ``entrances`` is absent and ENTRANCE_CITY_UNKNOWN is warned.
+
 Terrain is flat in the detail scene (ground plate at y = 0 = base_y); the ground height of the original DEM is not
 reproduced. Heights use the metersPerFloor / defaultBuildingHeight of the generate run that produced the cache
 (stored next to the OSM cache), else 3.5 / 10.5."""
@@ -218,6 +223,70 @@ def _subset_for_target(gdf, bid: str, vs: float, neighbours: bool, cfg: Config, 
     return gdf.iloc[sel], seed
 
 
+def _city_info(ref: dict, bbox: dict):
+    """-> (cityVoxelSize, baseY) of the generate run this detail belongs to, or None. The host may pass them in
+    ``ref.cityVoxelSize`` / ``ref.cityBaseY`` (BuildingInfo.baseY of the city index); otherwise the values that the
+    generate run left in the cache (bindex.remember_city) are used."""
+    try:
+        cvs = ref.get("cityVoxelSize")
+        base = ref.get("cityBaseY")
+        cvs = float(cvs) if cvs is not None else None
+        base = int(base) if base is not None else None
+        if cvs is not None and not (math.isfinite(cvs) and cvs > 0):
+            cvs = None
+    except (TypeError, ValueError):
+        cvs = base = None
+    return cvs, base
+
+
+def _map_entrances(raw: list, foot, cvs: float, base_y: int, bbox: dict, warn) -> list:
+    """Interior entrance records (detail frame) -> contract WalkEntrance dicts (adds edge, city, cityDir).
+    Doors that are not on the outer ring of the footprint (courtyard / between parts) are skipped."""
+    from shapely.geometry import Point
+    from .grid import make_grid
+    cgrid, _ = make_grid(bbox, cvs)
+    co = np.asarray(foot.exterior.coords)
+    a, b = co[:-1], co[1:]
+    d = b - a
+    L2 = np.maximum((d * d).sum(1), 1e-12)
+    out = []
+    for r in raw:
+        px, py = r["pt"]
+        t = np.clip(((px - a[:, 0]) * d[:, 0] + (py - a[:, 1]) * d[:, 1]) / L2, 0, 1)
+        q = a + d * t[:, None]
+        dist = np.hypot(q[:, 0] - px, q[:, 1] - py)
+        # outward normal of a CCW ring edge = right of travel; the door must face the way the edge faces
+        ln = np.sqrt(L2)
+        nout = np.column_stack([d[:, 1] / ln, -d[:, 0] / ln])
+        facing = nout[:, 0] * (-r["n_in"][0]) + nout[:, 1] * (-r["n_in"][1])
+        ok = (dist <= 1.0) & (facing > 0.5)
+        if not ok.any():
+            warn("ENTRANCE_UNUSABLE", "A door is not on the outer wall ring of the building (courtyard or "
+                 "between parts); not used as a walking entrance")
+            continue
+        k = int(np.argmin(np.where(ok, dist, 1e18)))
+        out_dir = (-r["n_in"][0], -r["n_in"][1])         # (E, N) pointing outside
+        cell = None
+        step = max(0.1, 0.25 * cvs)
+        t_ = 0.3
+        while t_ <= 3.0 * cvs + 1.0:
+            E, N = px + out_dir[0] * t_, py + out_dir[1] * t_
+            cx = int(math.floor((E - cgrid.e0) / cvs))
+            cz = int(math.floor((cgrid.n0 - N) / cvs))
+            ce, cn = cgrid.e0 + (cx + 0.5) * cvs, cgrid.n0 - (cz + 0.5) * cvs
+            if not foot.contains(Point(ce, cn)):
+                cell = (cx, cz)
+                break
+            t_ += step
+        if cell is None:
+            warn("ENTRANCE_UNUSABLE", "No free city cell in front of a door; not used as a walking entrance")
+            continue
+        out.append({"edge": k, "city": [cell[0], int(base_y), cell[1]],
+                    "cityDir": [round(out_dir[0], 4), round(-out_dir[1], 4)],
+                    "inside": r["inside"], "outside": r["outside"], "dir": r["dir"], "widthM": r["widthM"]})
+    return out
+
+
 def run_detail(job: Job, p: dict, cfg: Config = DEFAULT_CONFIG) -> None:
     from ..osm import fetch as osmfetch
     from ..pipeline import _palette, out_dir
@@ -385,11 +454,11 @@ def run_detail(job: Job, p: dict, cfg: Config = DEFAULT_CONFIG) -> None:
         levels = max(1, int(q["interior"]["levelsOverride"]))
     levels = max(1, min(levels, MAX_LEVELS, max(1, int(primary.eave_y or 2) - primary.base_y - 1)))
     def _fit(m: Building, lv: int, what: str) -> int:
-        """storeys that really fit under the eaves (>= 2.1 m each); the roof volume does not count as height"""
+        """storeys that really fit under the eaves (>= interior.min_storey_rows, ~2.7 m each: stairs stack one storey apart); the roof volume does not count as height"""
         rows = max(1, int(m.eave_y or 2) - m.base_y - 1)
         fit = max(1, rows // interior.min_storey_rows(vs))
         if lv > fit:
-            job.warning("INTERIOR_SIMPLIFIED", f"{what}: only {fit} storey(s) of at least 2.1 m fit under the eaves "
+            job.warning("INTERIOR_SIMPLIFIED", f"{what}: only {fit} storey(s) of at least {interior.min_storey_rows(vs) * vs:.1f} m fit under the eaves "
                         f"({rows * vs:.1f} m); {lv} requested, {fit} built")
             return fit
         return lv
@@ -398,6 +467,7 @@ def run_detail(job: Job, p: dict, cfg: Config = DEFAULT_CONFIG) -> None:
     tw = np.concatenate([b.wx for b in members]); ty = np.concatenate([b.wy for b in members])
     tz = np.concatenate([b.wz for b in members])
     tc = np.concatenate([b.wall_rgb for b in members]).astype(np.uint8)
+    entrances = None      # walking demo: set when an interior was built (and the city frame is known)
     openings: list = []
     n_win = n_door = 0
     wall_t = 1
@@ -428,12 +498,15 @@ def run_detail(job: Job, p: dict, cfg: Config = DEFAULT_CONFIG) -> None:
         job.progress("facade", 100, "Facade done")
     job.check()
 
+    neighbour_parts: list = []      # never touched when doorways are carved
     for b in others:  # neighbour shells
         if b.count:
             nbx, nby, nbz, nbc = _clip(b.wx, b.wy, b.wz, pack(b.wall_rgb, M["wall"]), grid)
             parts.append([nbx, nby, nbz, nbc])
+            neighbour_parts.append(parts[-1])
             rx, ry, rz, rc = _clip(b.rx, b.ry, b.rz, pack(_roof_colours(b), M["roof"]), grid)
             parts.append([rx, ry, rz, rc])
+            neighbour_parts.append(parts[-1])
     parts.append([tw, ty, tz, pack(tc, M["wall"])])
     del tw, ty, tz, tc
     for b in members:
@@ -457,6 +530,7 @@ def run_detail(job: Job, p: dict, cfg: Config = DEFAULT_CONFIG) -> None:
                                    key=lambda m: (-m.poly.area, m.key))
         used = 0
         rooms_total = 0
+        raw_ents: list = []
         for mi, m in enumerate(order):
             if mi:
                 job.progress("interior", 100.0 * mi / len(order), f"Building interior of part {mi + 1}/{len(order)}")
@@ -491,6 +565,7 @@ def run_detail(job: Job, p: dict, cfg: Config = DEFAULT_CONFIG) -> None:
             for code, msg in m.detail.warnings:
                 job.warning(code, msg if mi == 0 else f"{msg} (building part {mi + 1})")
             rooms_total += int(getattr(m.detail, "rooms", 0) or 0)
+            raw_ents += list(getattr(m.detail, "entrances_raw", None) or [])
             n_door += int(getattr(m.detail, "doors_added", 0) or 0)
         primary.detail.rooms = rooms_total
         lb = getattr(primary.detail, "levels_built", None)
@@ -498,6 +573,37 @@ def run_detail(job: Job, p: dict, cfg: Config = DEFAULT_CONFIG) -> None:
             levels = int(lb)
             floor_ys = [int(v) for v in primary.detail.floor_ys_built]
         job.progress("interior", 100, "Interior done")
+        from shapely.geometry import Point
+        nb_ids = {id(x_) for x_ in neighbour_parts}
+        for e in raw_ents:      # open the doorways: nobody can walk through a closed door leaf
+            # only this building's own wall / door leaf: not the shells of neighbours (their parts are skipped) and not
+            # voxels inside the footprint of another part or neighbour that does not touch the door
+            pt_ = Point(e["pt"])
+            others_ = [o.poly for o in others + members if o.poly is not None and not o.poly.is_empty
+                       and o.poly.distance(pt_) > 0.05]
+            avoid = shapely.union_all(others_) if others_ else None
+            if avoid is not None:
+                shapely.prepare(avoid)
+            for part in parts:
+                if id(part) in nb_ids or not len(part[0]):
+                    continue
+                hit = interior.doorway_mask(part[0], part[1], part[2], e, grid, avoid)
+                if hit.any():
+                    keep = ~hit
+                    part[0], part[1], part[2], part[3] = (a_[keep] for a_ in part[:4])
+        if raw_ents:
+            cvs, cbase = _city_info(p.get("ref") or {}, bbox)
+            if cvs is None or cbase is None:
+                c2 = bindex.lookup_city(bbox, cvs, bid)
+                if c2 is not None:
+                    cvs, cbase = c2
+            if cvs is None or cbase is None:
+                job.warning("ENTRANCE_CITY_UNKNOWN", "The city voxel size / ground height of this building is not "
+                            "known (generate the scene again); the building cannot be entered in the walking demo")
+            else:
+                entrances = _map_entrances(raw_ents, foot, cvs, cbase, bbox, job.warning)
+        else:
+            entrances = []
     job.check()
 
     # ---- merge, dedupe (later wins), sort (x, z, y): slice-wise, int32, inputs released as they are consumed
@@ -533,4 +639,6 @@ def run_detail(job: Job, p: dict, cfg: Config = DEFAULT_CONFIG) -> None:
     dstats = {"voxelCount": int(len(X)), "levels": levels, "rooms": int(getattr(primary.detail, "rooms", 0)),
               "windows": n_win, "doors": n_door, "elapsedMs": int((time.time() - t0) * 1000),
               "floorYs": floor_ys}
+    if entrances is not None:
+        dstats["entrances"] = entrances
     job.result({"kind": "detail", "vwgPath": path, "stats": dstats})

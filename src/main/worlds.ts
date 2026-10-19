@@ -12,6 +12,7 @@ import type {
   GenerateStats,
   WorldMeta,
 } from '../shared/contract';
+import { sanitizeEntrances } from './validate';
 import { copyFileAtomic, dirSize, fileSize, fsyncDir, readJsonFile, SerialQueue, writeFileAtomic } from './fsutil';
 
 /**
@@ -107,7 +108,12 @@ function normaliseDetailStats(s: unknown): DetailStats {
   const x = (s && typeof s === 'object' ? s : {}) as Record<string, unknown>;
   const n = (k: string): number => (fin(x[k]) && (x[k] as number) >= 0 ? (x[k] as number) : 0);
   const fy = Array.isArray(x.floorYs) ? x.floorYs.filter((v): v is number => Number.isInteger(v)).slice(0, 300) : [];
-  return { voxelCount: n('voxelCount'), levels: n('levels'), rooms: n('rooms'), windows: n('windows'), doors: n('doors'), elapsedMs: n('elapsedMs'), floorYs: fy };
+  const entrances = sanitizeEntrances(x.entrances); // undefined for legacy details: stays absent ("not enterable")
+  return {
+    voxelCount: n('voxelCount'), levels: n('levels'), rooms: n('rooms'), windows: n('windows'), doors: n('doors'), elapsedMs: n('elapsedMs'),
+    floorYs: fy,
+    ...(entrances ? { entrances } : {}),
+  };
 }
 
 /** "<lat,lon> <YYYY-MM-DD HH:mm> · <source>" (local time; source = "Overpass" or the region name). */
@@ -476,7 +482,7 @@ export class WorldStore {
   }
 
   /** Resolve a world for opening: re-checks that its files still exist (drops it from the library if not). */
-  async open(id: string): Promise<SavedWorld> {
+  async open(id: string, inSlot?: (w: SavedWorld) => void): Promise<SavedWorld> {
     await this.init();
     return this.q.run(async () => {
       if (isValidId(id) && !this.worlds.has(id)) await this.scan(); // may have appeared out-of-band
@@ -492,7 +498,9 @@ export class WorldStore {
       const idx = this.worldIndex(id);
       const hasIdx = (await fileSize(idx)) !== null;
       w.hasBuildingIndex = hasIdx;
-      return { meta: clone(w), vwgPath, ...(hasIdx ? { buildingIndexPath: idx } : {}) };
+      const saved: SavedWorld = { meta: clone(w), vwgPath, ...(hasIdx ? { buildingIndexPath: idx } : {}) };
+      inSlot?.(saved); // runs inside the queue slot: nothing can delete/rename this world between the check and the callback
+      return saved;
     });
   }
 
@@ -609,9 +617,10 @@ export class WorldStore {
     });
   }
 
-  async rename(id: string, name: string): Promise<WorldMeta> {
+  async rename(id: string, name: string, guard?: () => void): Promise<WorldMeta> {
     await this.init();
     return this.q.run(async () => {
+      guard?.();
       const w = this.require(id);
       const n = cleanWorldName(name);
       const next: WorldMeta = { ...w, name: n, updatedAt: new Date().toISOString() };
@@ -621,9 +630,10 @@ export class WorldStore {
     });
   }
 
-  async deleteWorld(id: string): Promise<void> {
+  async deleteWorld(id: string, guard?: () => void): Promise<void> {
     await this.init();
     return this.q.run(async () => {
+      guard?.(); // evaluated in queue order (see open's inSlot)
       this.require(id);
       const dir = this.worldDir(id);
       // Move out of the way first (atomic), then delete: a crash mid-delete leaves only a .tmp- dir to sweep.
@@ -636,9 +646,10 @@ export class WorldStore {
     });
   }
 
-  async deleteDetail(worldId: string, detailId: string): Promise<WorldMeta> {
+  async deleteDetail(worldId: string, detailId: string, guard?: () => void): Promise<WorldMeta> {
     await this.init();
     return this.q.run(async () => {
+      guard?.();
       const w = this.require(worldId);
       if (!isValidId(detailId)) throw new WorldError('BAD_REQUEST', 'invalid detail id');
       if (!w.details.some((d) => d.id === detailId)) throw new WorldError('WORLD_NOT_FOUND', 'detail not found');
@@ -658,6 +669,17 @@ export class WorldStore {
       const idx = await readJsonFile<{ buildings?: Array<{ id?: string; name?: string }> }>(this.worldIndex(worldId));
       const b = idx.buildings?.find((x) => x.id === buildingId);
       return typeof b?.name === 'string' && b.name ? b.name.slice(0, 120) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** BuildingInfo.baseY of a building from the world's index (undefined: no index / unknown building). */
+  async buildingBaseY(worldId: string, buildingId: string): Promise<number | undefined> {
+    try {
+      const idx = await readJsonFile<{ buildings?: Array<{ id?: string; baseY?: unknown }> }>(this.worldIndex(worldId));
+      const y = idx.buildings?.find((x) => x.id === buildingId)?.baseY;
+      return typeof y === 'number' && Number.isFinite(y) ? y : undefined;
     } catch {
       return undefined;
     }

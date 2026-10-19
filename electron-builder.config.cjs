@@ -28,6 +28,11 @@ module.exports = {
     entitlementsInherit: 'build/entitlements.mac.plist',
     identity: hasCert ? undefined : '-',
     notarize,
+    // "Show my location" on the map (navigator.geolocation -> CoreLocation)
+    extendInfo: {
+      NSLocationWhenInUseUsageDescription: 'VoxelWorlds uses your location only to centre the map on where you are.',
+      NSLocationUsageDescription: 'VoxelWorlds uses your location only to centre the map on where you are.',
+    },
   },
   dmg: { sign: false },
   // Windows x64, unsigned (set WIN_CSC_LINK + WIN_CSC_KEY_PASSWORD to sign). SmartScreen will warn when unsigned.

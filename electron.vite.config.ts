@@ -31,6 +31,13 @@ export default defineConfig({
     root: resolve(__dirname, 'src/renderer'),
     resolve: { alias },
     plugins: [cspMeta()],
-    build: { rollupOptions: { input: { index: resolve(__dirname, 'src/renderer/index.html') } } },
+    build: {
+      rollupOptions: {
+        input: {
+          index: resolve(__dirname, 'src/renderer/index.html'),
+          walk: resolve(__dirname, 'src/renderer/walk.html'), // walking demo window (second page; cspMeta applies to every page)
+        },
+      },
+    },
   },
 });

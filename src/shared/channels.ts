@@ -20,6 +20,14 @@ export const CH = {
   openDetail: 'voxel:worlds:openDetail',
   deleteDetail: 'voxel:worlds:deleteDetail',
   worldSaved: 'voxel:worlds:saved',
+  // walking demo
+  startWalk: 'voxel:walk:start',
+  walkSession: 'voxel:walk:session',
+  endWalk: 'voxel:walk:end',
+  walkActive: 'voxel:walk:active',
+  walkFocus: 'voxel:walk:focus',
+  walkExit: 'voxel:walk:exit',
+  walkState: 'voxel:walk:state',
   // geodata (Geofabrik extracts)
   listGeodataRegions: 'voxel:geodata:regions',
   suggestGeodataRegions: 'voxel:geodata:suggest',

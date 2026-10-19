@@ -1,4 +1,4 @@
-import type { AnalyzeFacadeParams, BBox, BuildingIndex, DataSource, DetailParams, DetailStats, FacadeSpec, GenerateParams } from '../shared/contract';
+import type { AnalyzeFacadeParams, BBox, BuildingIndex, DataSource, DetailParams, DetailStats, FacadeSpec, GenerateParams, WalkEntrance } from '../shared/contract';
 
 /** Pure parameter validation (no electron imports so it is unit-testable). All errors are BAD_REQUEST. */
 
@@ -95,6 +95,49 @@ export function validateFacadeSpec(s: FacadeSpec): void {
   if (!c || !['floors', 'windows', 'doors', 'colour'].every((k) => rng((c as unknown as Record<string, unknown>)[k], 0, 1))) {
     bad('facade.spec confidence invalid');
   }
+}
+
+const tup = (v: unknown, n: number): v is number[] => Array.isArray(v) && v.length === n && v.every(fin);
+const unit2 = (v: unknown): v is [number, number] => tup(v, 2) && Math.abs(Math.hypot(v[0], v[1]) - 1) < 0.05;
+export const MAX_ENTRANCES = 64;
+
+/**
+ * Walking demo: keep only well-formed entrances (finite numbers, unit direction vectors, width >= 0.9 m), at most
+ * MAX_ENTRANCES. Returns undefined when `v` is not an array (legacy details have none: they stay "not enterable").
+ */
+export function sanitizeEntrances(v: unknown): WalkEntrance[] | undefined {
+  if (!Array.isArray(v)) return undefined;
+  const out: WalkEntrance[] = [];
+  for (const e of v as Array<Record<string, unknown> | null>) {
+    if (out.length >= MAX_ENTRANCES) break;
+    if (!e || typeof e !== 'object') continue;
+    if (!Number.isInteger(e.edge) || (e.edge as number) < 0) continue;
+    if (!tup(e.city, 3) || !tup(e.inside, 3) || !tup(e.outside, 3)) continue;
+    if (!unit2(e.cityDir) || !unit2(e.dir)) continue;
+    if (!fin(e.widthM) || e.widthM < 0.9 || e.widthM > 50) continue;
+    out.push({
+      edge: e.edge as number,
+      city: [e.city[0], e.city[1], e.city[2]],
+      cityDir: [e.cityDir[0], e.cityDir[1]],
+      inside: [e.inside[0], e.inside[1], e.inside[2]],
+      outside: [e.outside[0], e.outside[1], e.outside[2]],
+      dir: [e.dir[0], e.dir[1]],
+      widthM: e.widthM,
+    });
+  }
+  return out;
+}
+
+/** Main-owned city frame of a detail ref: drops whatever the renderer sent, sets only finite values read from the library. */
+export function applyCityFrame<T extends { cityVoxelSize?: number; cityBaseY?: number }>(ref: T, voxelSize?: number, baseY?: number): T {
+  const { cityVoxelSize: _a, cityBaseY: _b, ...rest } = ref;
+  void _a;
+  void _b;
+  return {
+    ...(rest as T),
+    ...(fin(voxelSize) && voxelSize > 0 ? { cityVoxelSize: voxelSize } : {}),
+    ...(fin(baseY) ? { cityBaseY: baseY } : {}),
+  };
 }
 
 export function validateDetailStats(s: DetailStats): void {

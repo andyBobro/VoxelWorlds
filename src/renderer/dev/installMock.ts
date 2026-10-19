@@ -218,6 +218,8 @@ if (import.meta.env.DEV && typeof window !== 'undefined' && !window.voxel) {
     return v;
   };
 
+  let walkOn = false;
+  const walkCbs = new Set<(a: boolean) => void>();
   const mock: VoxelApi = {
     async generate(params: GenerateParams) {
       rec('generate', params);
@@ -339,6 +341,16 @@ if (import.meta.env.DEV && typeof window !== 'undefined' && !window.voxel) {
       touch(w.meta);
       fireSaved(w.meta);
     },
+    // Walking demo (browser mock): no second window; the lock overlay is driven by the same state events.
+    async startWalk(worldId, spawn) {
+      rec('startWalk', { worldId, spawn });
+      if (walkOn) throw new Error('BUSY: a walking view is already open');
+      walkOn = true;
+      for (const f of walkCbs) f(true);
+    },
+    onWalkState: (cb) => { walkCbs.add(cb); cb(walkOn); return () => walkCbs.delete(cb); },
+    async walkSession() { throw new Error('BAD_REQUEST: mock has no walking window'); },
+    async endWalk() { throw new Error('BAD_REQUEST: only the walking window may call this'); },
     onWorldSaved: (cb) => { savedCbs.add(cb); return () => savedCbs.delete(cb); },
 
     async listGeodataRegions(opts) {
@@ -423,6 +435,10 @@ if (import.meta.env.DEV && typeof window !== 'undefined' && !window.voxel) {
     onWarning: () => () => undefined,
     onLog: () => () => undefined,
   };
+  Object.assign(mock, {
+    async focusWalk() { rec('focusWalk', null); },
+    async exitWalk() { rec('exitWalk', null); walkOn = false; for (const f of walkCbs) f(false); },
+  });
   window.voxel = mock;
   (window as unknown as Record<string, unknown>).__vwMock = log;
 }

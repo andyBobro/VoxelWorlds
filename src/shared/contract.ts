@@ -144,6 +144,12 @@ export interface BuildingRef {
   /** the values the original generate used; python falls back to its saved copy, then 3.5 / 10.5 */
   metersPerFloor?: number;
   defaultBuildingHeight?: number;
+  /**
+   * Set by MAIN (never the renderer) for the walking demo: the city world's voxel size (metres) and the city index's
+   * `BuildingInfo.baseY` of this building. Python uses them to express WalkEntrance.city in the city frame.
+   */
+  cityVoxelSize?: number;
+  cityBaseY?: number;
   /** same source as the original generate so detail sees identical OSM data (main fills pbfPath) */
   dataSource?: DataSource;
 }
@@ -209,6 +215,37 @@ export interface DetailStats {
   elapsedMs: number;
   /** y voxel index of the top of each storey's floor slab, bottom -> top; exactly `levels` entries, the roof is NOT included (cutaway slider) */
   floorYs: number[];
+  /**
+   * Walking demo: every usable entrance of the building (>= 1 when `doors` > 0 and an interior exists), one per
+   * door that leads from outside into a walkable ground-floor space. ABSENT on details saved before the walking
+   * demo existed: such a detail is not enterable until it is regenerated. See WalkEntrance.
+   */
+  entrances?: WalkEntrance[];
+}
+
+/**
+ * One door connecting the outdoors to the interior. Frames:
+ *  - city scene: VOXEL INDICES of the city .vwg (world metres = index * city voxelSize), +x east, +z south, Y up
+ *  - detail scene: METRES in the detail .vwg's own world frame (world metres = voxel index * detail voxelSize,
+ *    the same convention the preview uses for any .vwg); the detail scene is flat, ground at the footprint base
+ * "feet" = the lowest point of the character (standing on the floor).
+ */
+export interface WalkEntrance {
+  /** BuildingInfo.footprint edge the door is in (edge i = ring[i] -> ring[i+1]) */
+  edge: number;
+  /** city scene: ground cell [x, y, z] directly outside the door (y = voxel index of the first free cell above ground). Walking into the trigger zone around it enters the building. */
+  city: [number, number, number];
+  // NOTE: city[1] is the building's baseY (python has no terrain): the walking client re-snaps y to the real ground of that column.
+  /** city scene: unit vector [x, z] pointing from the building towards the outside (door normal, outward) */
+  cityDir: [number, number];
+  /** detail scene: feet position [x, y, z] in metres just INSIDE the door (spawn when entering); never inside a wall, with >= 2 m headroom and a walkable floor */
+  inside: [number, number, number];
+  /** detail scene: feet position [x, y, z] in metres just OUTSIDE the door (leaving trigger = walking out through the door plane) */
+  outside: [number, number, number];
+  /** detail scene: unit vector [x, z] pointing from outside to inside (looking direction when entering) */
+  dir: [number, number];
+  /** door opening width in metres (>= 0.9) */
+  widthM: number;
 }
 
 // ───────────────────── Renderer API (preload) ─────────────────────
@@ -239,6 +276,21 @@ export interface VoxelApi {
   /** opens a saved detail instantly (no python); the returned vwgPath works with readVwg/exportAs */
   openDetail(worldId: string, detailId: string): Promise<{ vwgPath: string; stats: DetailStats; record: DetailRecord }>;
   deleteDetail(worldId: string, detailId: string): Promise<void>;
+
+  // ── Walking demo: a separate modal window; the main window is locked while it is open ──
+  /**
+   * Opens the walking window (modal child of the main window) for a saved world. Main resolves every path itself
+   * from the library (the renderer never supplies a path). `spawn` = city voxel [x, z] to start at (ground is looked up);
+   * absent = the world centre. Rejects: WORLD_NOT_FOUND, BUSY (a generate/detail job is running or a walk is already open),
+   * NO_DATA (world has no voxels). Resolves once the window is created, not when it closes.
+   */
+  startWalk(worldId: string, spawn?: { x: number; z: number }): Promise<void>;
+  /** true while the walking window is open (main window UI uses it to disable map editing, generate, tabs, worlds actions); fires immediately with the current value on subscribe */
+  onWalkState(cb: (active: boolean) => void): () => void;
+  /** WALK WINDOW ONLY (main rejects other callers with BAD_REQUEST): what to walk */
+  walkSession(): Promise<WalkSession>;
+  /** WALK WINDOW ONLY: close the walking window and return the app to normal */
+  endWalk(): Promise<void>;
   /** fires after a generate or detail has been saved */
   onWorldSaved(cb: (e: { world: WorldMeta; detail?: DetailRecord }) => void): () => void;
 
@@ -279,6 +331,14 @@ export interface WorldMeta {
   /** for local-extract worlds: the extract's identity when the world was generated (staleness warning) */
   sourceInfo?: { sizeBytes: number; sourceDate?: string };
   details: DetailRecord[];            // newest first
+}
+
+/** Everything the walking window needs; paths are already trusted/resolved by main. */
+export interface WalkSession {
+  world: WorldMeta;                   // includes details (DetailRecord[]) at open time
+  vwgPath: string;
+  buildingIndexPath: string;          // '' when the world has none (nothing enterable)
+  spawn?: { x: number; z: number };
 }
 
 export interface DetailRecord {

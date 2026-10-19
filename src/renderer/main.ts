@@ -33,7 +33,7 @@ detailPanel.onBusy = (b) => {
   detailBusy = b;
   if (!b) flushRecovery();
   controls.setExternalBlock(b ? 'A building detail job is running - cancel it first' : opening ? 'Opening a world...' : '');
-  worldsPanel.refreshBusy();
+  refreshBusy();
 };
 detailPanel.onRecord = (r) => session.upsertDetailRecord(r);
 detailPanel.deleteRecord = (r) => session.deleteDetail(r);
@@ -54,6 +54,8 @@ let lastVwgPath: string | null = null;
 let lastIndexPath: string | null = null;
 let lastParams: Omit<GenerateParams, 'mapillaryToken'> | null = null;
 let lastBuildingCount: number | undefined;
+/** voxel count of the city on screen (sizes the preview-failure advice) */
+let lastVoxelCount: number | undefined;
 let lastSourceInfo: WorldMeta['sourceInfo'];
 let cityBuildings: BuildingInfo[] = [];
 let reloading = false;
@@ -62,7 +64,15 @@ let previewDisposed = false;
 let cityShown = false;
 
 let generating = false;
+/** the walking window is open: the whole main window is locked (see setWalking) */
+let walking = false;
 let exportName = 'voxelworld';
+
+/** Busy state changed: worlds actions and "Walk here" follow it. */
+function refreshBusy(): void {
+  worldsPanel.refreshBusy();
+  syncWalkHere();
+}
 
 const source = new DataSourceControl($('source-box'), () => session.worlds);
 const controls = new Controls({
@@ -110,7 +120,8 @@ const worldsPanel = new WorldsPanel($('worlds-root'), session, {
     toast('The world on screen was deleted and closed.', 'warn', 5000);
   },
   regionName: (id) => source.geo.byId.get(id)?.name ?? id,
-  busyReason: () => (generating ? 'A generate is running' : detailBusy ? 'A building detail job is running' : opening ? 'Opening a world...' : ''),
+  walk: (m) => startWalk(m.id),
+  busyReason: () => (walking ? 'The walking view is open' : generating ? 'A generate is running' : detailBusy ? 'A building detail job is running' : opening ? 'Opening a world...' : ''),
 });
 
 // Saved-detail markers + building-panel lists follow the session.
@@ -128,6 +139,7 @@ function syncSaved(): void {
   markerCheck.disabled = marked.length === 0;
   worldsBadge.hidden = session.worlds.length === 0;
   worldsBadge.textContent = String(session.worlds.length);
+  syncWalkHere();
 }
 markerCheck.addEventListener('change', () => { preview.setMarkersVisible(markerCheck.checked); markerCheck.blur(); });
 session.onChange(syncSaved);
@@ -195,12 +207,13 @@ async function loadPreview(): Promise<'ok' | 'kept' | 'lost'> {
     const msg = errorText(e);
     if (previewDisposed) { cityShown = false; detailPanel.clear(); } // old scene is gone, selection is meaningless
     log.add(`Preview failed: ${msg}`, 'err');
-    failedMsg.textContent = `Preview failed: ${friendlyPreviewError(msg, lastParams?.voxelSize)}`;
+    failedMsg.textContent = `Preview failed: ${friendlyPreviewError(msg, lastParams?.voxelSize, lastVoxelCount)}`;
     failedBox.hidden = false;
     return previewDisposed ? 'lost' : 'kept';
   } finally {
     reloading = false;
     reloadBtn.disabled = false;
+    syncWalkHere();
     flushRecovery(); // the new handle may have lost its context while this load was still running
   }
 }
@@ -235,7 +248,7 @@ const showPreviewFailed = (text: string): void => {
 };
 function recoverPreview(): void {
   if (!remountLimiter.tryAcquire()) {
-    showPreviewFailed(friendlyPreviewError('WebGL context lost', lastParams?.voxelSize));
+    showPreviewFailed(friendlyPreviewError('WebGL context lost', lastParams?.voxelSize, lastVoxelCount));
     return;
   }
   if (preview.inDetail) {
@@ -268,11 +281,11 @@ reloadBtn.addEventListener('click', () => {
 });
 
 async function generate(): Promise<void> {
-  if (generating) return;
+  if (generating || walking) return;
   const params = controls.readParams();
   if (!params) return;
   generating = true;
-  worldsPanel.refreshBusy();
+  refreshBusy();
   detailPanel.resetAll(); // leave the detail view and drop selection/photo state before the city is replaced
   detailPanel.setLocked(true);
   controls.setBusy(true);
@@ -294,6 +307,7 @@ async function generate(): Promise<void> {
     lastIndexPath = stats.buildingIndexPath ?? null;
     lastParams = params;
     lastBuildingCount = stats.buildingCount;
+    lastVoxelCount = stats.voxelCount;
     if (res.world && !res.saveError) {
       displayedWorldId = res.world.id;
       lastSourceInfo = res.world.sourceInfo;
@@ -330,7 +344,7 @@ async function generate(): Promise<void> {
   } finally {
     generating = false;
     flushRecovery();
-    worldsPanel.refreshBusy();
+    refreshBusy();
     detailPanel.setLocked(false);
     controls.setBusy(false);
   }
@@ -352,10 +366,10 @@ function applyWorldParams(m: WorldMeta): void {
 
 /** Opens a saved world exactly like a fresh generate: preview, building index, picking, HUD, export target. */
 async function openWorld(meta: WorldMeta): Promise<void> {
-  if (generating || detailBusy || opening) return;
+  if (generating || detailBusy || opening || walking) return;
   opening = true;
   controls.setExternalBlock('Opening a world...');
-  worldsPanel.refreshBusy();
+  refreshBusy();
   detailPanel.setLocked(true);
   const prev = { vwg: lastVwgPath, idx: lastIndexPath, params: lastParams, count: lastBuildingCount, name: exportName, shown: displayedWorldId };
   try {
@@ -364,6 +378,7 @@ async function openWorld(meta: WorldMeta): Promise<void> {
     lastIndexPath = res.buildingIndexPath ?? res.stats.buildingIndexPath ?? null;
     lastParams = { ...res.meta.params, bbox: res.meta.params?.bbox ?? res.meta.bbox };
     lastBuildingCount = res.stats.buildingCount;
+    lastVoxelCount = res.stats.voxelCount;
     lastSourceInfo = res.meta.sourceInfo;
     exportName = `voxelworld_${res.meta.bbox.latMin.toFixed(3)}_${res.meta.bbox.lonMin.toFixed(3)}`;
     displayedWorldId = res.meta.id; // the building index (context for details) is read inside loadPreview
@@ -395,9 +410,85 @@ async function openWorld(meta: WorldMeta): Promise<void> {
     flushRecovery();
     detailPanel.setLocked(false);
     controls.setExternalBlock(detailBusy ? 'A building detail job is running - cancel it first' : '');
-    worldsPanel.refreshBusy();
+    refreshBusy();
   }
 }
+
+// ───────────────────────── Walking demo ─────────────────────────
+/** main-window-only helpers of the preload (not part of the frozen VoxelApi) */
+type WalkApi = typeof window.voxel & { focusWalk?: () => Promise<void>; exitWalk?: () => Promise<void> };
+const appRoot = $('app');
+const walkLock = $('walk-lock');
+const walkHere = $<HTMLButtonElement>('walk-here');
+let walkBusy = false; // a startWalk call is in flight
+let lockReturnFocus: Element | null = null;
+
+/** Why "Walk here" cannot be used right now ('' = it can). */
+function walkHereReason(): string {
+  if (walking) return 'The walking view is open';
+  if (walkBusy) return 'Opening the walking view...';
+  if (generating || detailBusy || opening || reloading) return 'Wait for the running job to finish';
+  if (!cityShown || !lastVwgPath) return 'Generate or open a world first';
+  if (!displayedWorldId) return 'This world is not saved in the library (saving failed), so it cannot be walked';
+  return '';
+}
+function syncWalkHere(): void {
+  const why = walkHereReason();
+  walkHere.disabled = !!why;
+  walkHere.title = why || 'Walk through this world in a new window, starting at the view\u2019s ground position';
+}
+
+/** Applied from onWalkState (also the crash/kill path: main broadcasts false when the walk window is gone). */
+function setWalking(active: boolean): void {
+  if (active === walking) return;
+  walking = active;
+  if (active) {
+    lockReturnFocus = document.activeElement;
+    if (lockReturnFocus instanceof HTMLElement) lockReturnFocus.blur();
+  }
+  appRoot.toggleAttribute('inert', active); // no pointer, no keyboard, no focus anywhere in the app
+  walkLock.hidden = !active;
+  map.setLocked(active);
+  detailPanel.setLocked(active || generating || opening);
+  preview.setPaused(active);
+  controls.setExternalBlock(active ? 'The walking view is open - close it to continue' : detailBusy ? 'A building detail job is running - cancel it first' : opening ? 'Opening a world...' : '');
+  refreshBusy();
+  syncWalkHere();
+  if (active) $('walk-lock-focus').focus();
+  else {
+    if (lockReturnFocus instanceof HTMLElement && lockReturnFocus.isConnected) lockReturnFocus.focus();
+    lockReturnFocus = null;
+    if (tabs.current === 'map') requestAnimationFrame(() => map.refresh());
+    flushRecovery();
+  }
+}
+
+async function startWalk(worldId: string, spawn?: { x: number; z: number }): Promise<void> {
+  if (walking || walkBusy) return;
+  walkBusy = true;
+  syncWalkHere();
+  try {
+    await window.voxel.startWalk(worldId, spawn);
+    log.add('Walking view opened.');
+  } catch (e) {
+    const msg = errorText(e);
+    log.add(`Walking view failed: ${msg}`, 'err');
+    toast(`Could not open the walking view: ${stripCode(msg)}`, 'err', 6000);
+  } finally {
+    walkBusy = false;
+    syncWalkHere();
+  }
+}
+
+walkHere.addEventListener('click', () => {
+  if (walkHereReason() || !displayedWorldId) return;
+  const spot = preview.viewSpot();
+  void startWalk(displayedWorldId, spot ?? undefined);
+});
+$('walk-lock-focus').addEventListener('click', () => void (window.voxel as WalkApi).focusWalk?.().catch(() => undefined));
+// "Exit walking" from the locked main window: only main can close the walk window from here, via a dedicated channel.
+$('walk-lock-exit').addEventListener('click', () => void (window.voxel as WalkApi).exitWalk?.().catch(() => undefined));
+window.voxel.onWalkState(setWalking);
 
 window.addEventListener('beforeunload', () => {
   session.dispose();

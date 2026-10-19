@@ -1,6 +1,6 @@
 # VoxelWorlds — Current State Summary
 
-_Single status file. Update in place; no other docs, no tests (user directive)._
+_Single status file; update in place. A README exists (user later asked for it) and vitest tests live in `tests/` (`npx vitest run`)._
 _Last updated: 2026-10-14 by teamlead._
 
 ## Goal
@@ -9,7 +9,7 @@ Electron desktop app: pick a bbox on a Leaflet map → Python pipeline (OSM + Ma
 Zero paid APIs: OSM + Mapillary v4 only.
 
 ## Constraints from user
-- DO NOT write tests. DO NOT write docs. Only keep this summary current.
+- (Superseded) The original "no tests, no docs" directive was lifted: the user later asked for the README and tests. Keep this summary current; add tests for new behaviour.
 
 ## Frozen contract
 `src/shared/contract.ts` — stdio JSON-lines IPC (Request/Event), `VoxelApi` preload surface,
@@ -170,6 +170,17 @@ Out of scope v1: photos of roofs, curved walls, multi-building photos, furnished
 - Eiffel bbox (lat 48.8575..48.8595, lon 2.2935..2.2965, voxelSize 2): 34 buildings, 17 photo-textured / 17 procedural, 43,747 voxels, ~20 s; wall voxels use 876 distinct colours (vs 28 procedural-only) with natural tones.
 - Token is NOT in the repo; copies only in session scratchpad. It was pasted in chat several times — rotate the client secret when done.
 
+## Walking demo (2026-10-19) — implemented, reviewed; verified in dev Electron, packaged build NOT tested
+- **Window**: `startWalk(worldId, spawn?)` opens a second BrowserWindow (`walk.html`, electron-vite multi-page, CSP meta applies to both pages) with the same hardening as the main window (sandbox, contextIsolation, same preload, no nodeIntegration). Windows/Linux: `modal: true` child. **macOS: non-modal child** (a modal child becomes a fixed-size sheet: no resize/fullscreen); there the lock is the main window's overlay + main-side rejections. F11 toggles fullscreen; `pointerLock`/`fullscreen` permissions are granted to the walk window only.
+- **Main-side session** (`src/main/walk.ts`, `ipc.ts`): `WalkManager` holds the single session; `WalkSession` is built from the library (world meta + details, vwgPath, buildingIndexPath, spawn), the renderer never supplies paths. Ends on X / Alt+F4 / `endWalk` / render-process-gone / load failure / main window closing / quit: releases the job slot (cancels a running walk job), closes the window, broadcasts `onWalkState(false)`, refocuses main. Validation order: invalid id, WORLD_NOT_FOUND, BUSY (job or walk), NO_DATA (0 voxels). The walk opens inside the world-library queue slot, so a concurrent deleteWorld/rename/deleteDetail is serialised with it (refused with BUSY if the walk came first; the walk gets WORLD_NOT_FOUND if the delete came first).
+- **IPC allow-list**: caller identity (`resolveSender`: main / walk / unknown / non-main frame) is passed explicitly into handlers. Walk window may call only readVwg, readBuildingIndex, openDetail, listDetails, detail, cancel, walkSession, endWalk, walkActive, and only for its own world's files/ids (plus the exact temp .vwg of an unsaved detail it produced; main's export/scene state is never touched by walk jobs). Everything else from it is BAD_REQUEST. While walking the main window gets BUSY on generate, cancel, detail, export, open/rename/delete world, deleteDetail, geodata download/delete, pickPhoto, analyzeFacade, startWalk. Job progress/warnings are routed to the walk window while it is open (warnings are also logged in the main log panel as `[walk] ...`).
+- **Locking UI** (main window): full-window overlay ("Walking view is open - close it to continue", "Return to walking window", "Exit walking"), `#app` is `inert`, map interactions and any draw/edit mode are aborted (`MapView.setLocked`), Generate/open/detail panel locked, 3D preview render loop paused (`PreviewHost.setPaused`) and resumed after. Entry points: Worlds tab "Walk" per world, 3D Preview "Walk here" (spawn = orbit target / camera projected to city voxel [x,z], `getViewSpot`). Disabled with a reason while a job runs or the world is unsaved.
+- **Contract**: `DetailStats.entrances?: WalkEntrance[]` (city frame = city voxel indices; detail frame = metres; fields edge, city, cityDir, inside, outside, dir, widthM). Sanitised (<=64, finite, unit dirs, width >= 0.9) in `validate.ts`, kept by the worlds library; legacy details without entrances still load and are simply not enterable. `BuildingRef.cityVoxelSize` / `cityBaseY` are filled by main from `WorldMeta.voxelSize` and the world's building index `baseY` (renderer values always overridden) before the ref goes to python, for detail calls from both windows; unknown building leaves `cityBaseY` unset and python reports BUILDING_NOT_FOUND as before.
+- **Client / generator** (other agents, see their notes): the walk client streams the world from its own `readVwg` copy; python carves doorways and emits the entrances; step-up rules (outdoor clamp(cityVs,.25,2) m, indoor <= 0.35 m) are defined by the renderer's walk physics (tests/walk-physics.test.ts); jump apex is a constant 0.5 m (JUMP_APEX_M, user decision) at any voxel size, so a 2 m ledge at 1 m voxels now blocks.
+- **Measured (reviewer/QA)**: 58M-voxel world at 120 fps in the walk window, heap 270-430 MB, 12 enter/exit cycles stable. electron-pro dev run: walk window opens, lock overlay + `inert` + map lock confirmed, closing via X / endWalk / Exit button / renderer crash / SIGKILL of the renderer all return the main window to normal; walk-sender and locked-main rejections confirmed.
+- **Known limits / untested**: the door leaf is an empty frame (no door object); stair fixes pending; pointer lock and F11 untested while the screen was locked; packaged build untested; Windows modal behaviour untested; on-demand `detail` from the walk window verified only by unit tests and code review at the main-process level.
+- Tests: `tests/main-walk.test.ts` (allow-list, manager lifecycle, startWalk paths, queue serialisation, sender resolution, entrances, city frame, onWalkState).
+
 ## Known limits / untested
 - Untested: elevation on hilly terrain, MagicaVoxel opening the .vox, Minecraft loading the .schem. Cancel verified during Overpass only.
 - Roofs flat only; no courtyards/holes, bridges, building `layer`. UTM zone has no Norway/Svalbard exceptions.
@@ -193,3 +204,6 @@ Out of scope v1: photos of roofs, curved walls, multi-building photos, furnished
 ## Windows 11 x64 build (2026-10-18)
 - `npm run build:win` (cross-builds from macOS): bundles python-build-standalone 3.10.20 win x64 + win_amd64 wheels into `build/python-runtime-win` (via the mac runtime's pip), then electron-builder → `release/VoxelWorlds-Setup-0.1.0-x64.exe` (NSIS, 172 MB) and `release/VoxelWorlds-0.1.0-x64.zip`.
 - UNTESTED on Windows: nothing could be executed on the build host. Unsigned (SmartScreen warning); exe icon/metadata not embedded (needs wine or a Windows host: drop `signAndEditExecutable: false`). First thing to check on Windows: python starts, generate (pbf + Overpass), worlds library, geodata download, quit leaves no python.exe.
+
+## Locate me (2026-10-19)
+- Map crosshair button (`src/renderer/map/mapView.ts`, `locate.ts`) uses OS geolocation, allowed only for the main window (`src/main/permissions.ts`); macOS Info.plist usage strings + location entitlement added; no IP fallback; real OS prompt/packaged/Windows not verified.

@@ -13,6 +13,7 @@ import type {
   ExportFormat,
   GenerateParams,
   GenerateStats,
+  WalkSession,
   WorldMeta,
 } from '../shared/contract';
 import {
@@ -30,6 +31,8 @@ import {
   validateBuildingIndex,
   validateDetail,
   validateDetailStats,
+  sanitizeEntrances,
+  applyCityFrame,
   validateFacadeSpec,
   validateBBox,
   validateGenerate,
@@ -39,6 +42,7 @@ import { GeodataManager } from './geodata';
 import { isInside, isInsideReal } from './fsutil';
 import { isValidId, WorldStore } from './worlds';
 import { errText } from './errors';
+import { authorize, prepareWalk, resolveSender, WalkManager, type SenderKind, type WalkWindowHandle } from './walk';
 import { MAX_PIXELS, orientBitmap, orientedSize, readImageInfo } from './image';
 
 /** Preview limits for pickPhoto (data: URL; the CSP already allows `img-src data:`). */
@@ -67,7 +71,18 @@ async function isFile(p: string): Promise<boolean> {
   }
 }
 
-export function registerIpc(getWindow: () => BrowserWindow | null): PythonBridge {
+export interface IpcHandle {
+  bridge: PythonBridge;
+  /** ends the walk (closes its window); used on quit / main-window close */
+  endWalk(reason: string): void;
+  /** is this webContents the walking window (permission handler) */
+  isWalkSender(id: number): boolean;
+}
+
+export function registerIpc(
+  getWindow: () => BrowserWindow | null,
+  openWalkWindow: (session: WalkSession, onGone: (reason: string) => void) => WalkWindowHandle,
+): IpcHandle {
   const tempDir = join(app.getPath('temp'), 'voxelworlds');
   mkdirSync(tempDir, { recursive: true });
   const userData = app.getPath('userData');
@@ -82,11 +97,61 @@ export function registerIpc(getWindow: () => BrowserWindow | null): PythonBridge
     const wc: WebContents | undefined = getWindow()?.webContents;
     if (wc && !wc.isDestroyed()) wc.send(channel, payload);
   };
+  /** Job events (progress/warning): the walk window while a walk is open (only it can run jobs then), else the main window. */
+  const sendJob = (channel: string, payload: unknown): void => {
+    if (walk.active) {
+      walk.send(channel, payload);
+      // the locked main window still keeps a record of warnings in its log panel
+      if (channel === CH.warning) {
+        const w = payload as { code: string; message: string };
+        send(CH.log, `[walk] [${w.code}] ${w.message}`);
+      }
+    } else send(channel, payload);
+  };
   const logMain = (m: string): void => {
     console.log(m);
     send(CH.log, m);
   };
   const worlds = new WorldStore(worldsRoot, (m) => logMain(m));
+  /** world the walk window may touch (details, vwg, index); null when no walk is open */
+  let walkWorldId: string | null = null;
+  let walkSessionData: WalkSession | null = null;
+  /** temp detail results of unsaved walk details (readable by the walk window only; dropped when the walk ends) */
+  const walkTemp = new Set<string>();
+  const walkWcId = (): number | undefined => walk.wcId;
+  const walk = new WalkManager({
+    open: (session, onGone) => {
+      walkWorldId = session.world.id;
+      walkSessionData = session;
+      try {
+        return openWalkWindow(session, onGone);
+      } catch (e) {
+        walkWorldId = null;
+        walkSessionData = null;
+        throw e;
+      }
+    },
+    broadcast: (active) => {
+      if (!active) {
+        walkWorldId = null;
+        walkSessionData = null;
+        if (walkTemp.size) {
+          walkTemp.clear();
+          rekeep(); // the temp results are unreferenced now: the next cleanup removes them
+        }
+      }
+      send(CH.walkState, active);
+    },
+    refocusMain: () => {
+      const w = getWindow();
+      if (w && !w.isDestroyed()) {
+        if (w.isMinimized()) w.restore();
+        w.focus();
+      }
+    },
+    releaseJob: () => cancelCurrent(),
+    log: (m) => logMain(m),
+  });
   const geodata = new GeodataManager({
     dir: geodataRoot,
     version: app.getVersion(),
@@ -95,16 +160,22 @@ export function registerIpc(getWindow: () => BrowserWindow | null): PythonBridge
   });
   void worlds.init().catch((e: Error) => logMain(`[worlds] scan failed: ${e.message}`));
 
-  /** Wrap a handler so failures reach the renderer as clean 'CODE: message' errors (see preload `job`). */
-  const handle = (channel: string, fn: (...args: any[]) => unknown): void => {
-    ipcMain.handle(channel, async (_e, ...args) => {
+  /**
+   * Wrap a handler so failures reach the renderer as clean 'CODE: message' errors (see preload `job`).
+   * The caller's identity is passed explicitly as the first argument (`from`); there is no shared state to read late.
+   */
+  const handleFrom = (channel: string, fn: (from: SenderKind, ...args: any[]) => unknown): void => {
+    ipcMain.handle(channel, async (e, ...args) => {
       try {
-        return await fn(...args);
+        const kind = resolveSender(e.sender.id, e.senderFrame ? e.senderFrame === e.sender.mainFrame : undefined, getWindow()?.webContents.id, walkWcId());
+        authorize(channel, kind, walk.active);
+        return await fn(kind, ...args);
       } catch (e) {
         return { __voxelError: errText(e) };
       }
     });
   };
+  const handle = (channel: string, fn: (...args: any[]) => unknown): void => handleFrom(channel, (_from, ...args) => fn(...args));
 
   /** Temp artefacts (vwg, sidecar json, rectified png) that must survive the next cleanup. */
   const keep = new Set<string>();
@@ -155,10 +226,10 @@ export function registerIpc(getWindow: () => BrowserWindow | null): PythonBridge
     cacheDir,
     listeners: {
       onProgress: ({ id, stage, pct, message, tile }) => {
-        if (!abandoned.has(id)) send(CH.progress, { stage, pct, message, ...(tile ? { tile } : {}) });
+        if (!abandoned.has(id)) sendJob(CH.progress, { stage, pct, message, ...(tile ? { tile } : {}) });
       },
       onWarning: ({ id, code, message }) => {
-        if (!abandoned.has(id)) send(CH.warning, { code, message });
+        if (!abandoned.has(id)) sendJob(CH.warning, { code, message });
       },
       onLog: (line) => send(CH.log, line),
     },
@@ -182,7 +253,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null): PythonBridge
 
   const rekeep = (): void => {
     keep.clear();
-    for (const p of [genVwg, detailVwg, genIndex, rectified]) if (p) keep.add(resolve(p));
+    for (const p of [genVwg, detailVwg, genIndex, rectified, ...walkTemp]) if (p) keep.add(resolve(p));
     cleanTemp(); // no-op while a job holds the slot; runJob cleans after releasing it
   };
 
@@ -216,8 +287,11 @@ export function registerIpc(getWindow: () => BrowserWindow | null): PythonBridge
     send_: (id: string) => Promise<R>,
     discard: (r: R) => string[],
     finalize?: (r: R) => Promise<T>,
+    from: SenderKind = 'main',
   ): Promise<T | R | { __voxelError: string }> {
     if (currentJob) throw new Error(`BAD_REQUEST: ${busyMsg}`);
+    // A walk may have opened (or closed) while the caller was awaiting validation: jobs belong to the window that is allowed now.
+    if (from === 'walk' ? !walk.active : walk.active) throw new Error('BUSY: the walking view is open; close it to continue');
     const id = bridge.newId(prefix);
     currentJob = id;
     const cancelled = new Promise<never>((_, reject) => {
@@ -271,10 +345,27 @@ export function registerIpc(getWindow: () => BrowserWindow | null): PythonBridge
     }
   }
 
+  /** Cancel whatever job holds the slot (user cancel, walk window closed). */
+  function cancelCurrent(): void {
+    if (!currentJob) return;
+    abandoned.add(currentJob);
+    bridge.cancel(currentJob);
+    cancelJob?.();
+  }
+
   const libWorld = (worldId: unknown): string => {
     if (!isValidId(worldId)) throw new Error('BAD_REQUEST: invalid world id');
     if (!worlds.has(worldId)) throw new Error('WORLD_NOT_FOUND: world not found');
     return worldId;
+  };
+  /** The walk window may only address the world it was opened for (`required`: the id must be given). */
+  const walkWorld = (id: unknown, required: boolean): void => {
+    if (id === undefined && !required) return;
+    if (!walkWorldId || id !== walkWorldId) throw new Error('BAD_REQUEST: not the world of the walking view');
+  };
+  /** evaluated inside the library queue: a walk that opened meanwhile blocks library mutations */
+  const noWalk = (): void => {
+    if (walk.active) throw new Error('BUSY: the walking view is open; close it to continue');
   };
   const busyGuard = (): void => {
     if (currentJob) throw new Error('BUSY: a generation or detail job is running; wait for it to finish or cancel it');
@@ -297,7 +388,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null): PythonBridge
   const normSource = (ds: DataSource | undefined): DataSource =>
     ds && ds.kind === 'pbf' ? { kind: 'pbf', regionId: ds.regionId } : { kind: 'overpass' };
 
-  const warn = (code: string, message: string): void => send(CH.warning, { code, message });
+  const warn = (code: string, message: string): void => sendJob(CH.warning, { code, message });
 
   handle(CH.generate, async (params: GenerateParams) => {
     if (currentJob) throw new Error('BAD_REQUEST: a generation is already running');
@@ -365,8 +456,9 @@ export function registerIpc(getWindow: () => BrowserWindow | null): PythonBridge
     );
   });
 
-  handle(CH.detail, async (params: DetailParams) => {
+  handleFrom(CH.detail, async (from, params: DetailParams) => {
     if (currentJob) throw new Error('BAD_REQUEST: another job is already running');
+    if (from === 'walk') walkWorld((params as { worldId?: unknown } | undefined)?.worldId, true);
     // Target world: explicit params.worldId (validated against the library) or the current one.
     const explicit = (params as { worldId?: unknown } | undefined)?.worldId;
     let worldId = currentWorldId;
@@ -377,7 +469,11 @@ export function registerIpc(getWindow: () => BrowserWindow | null): PythonBridge
       against = { bbox: { ...meta.bbox }, dataSource: normSource(meta.params.dataSource) };
     }
     validateDetail(params, against); // bbox AND dataSource.kind/regionId must equal that world's / the current scene's
-    const ref = { ...params.ref, dataSource: await geodata.resolveDataSource(against?.dataSource) };
+    let ref = { ...params.ref, dataSource: await geodata.resolveDataSource(against?.dataSource) };
+    // city frame for walk entrances: from the library only (never the renderer's values)
+    if (worldId && worlds.has(worldId)) {
+      ref = applyCityFrame(ref, (await worlds.get(worldId)).voxelSize, await worlds.buildingBaseY(worldId, params.ref.buildingId));
+    } else ref = applyCityFrame(ref);
     // pbf worlds: warn (but still run) when the local extract was replaced after the world was generated
     if (against?.dataSource?.kind === 'pbf' && worldId && worlds.has(worldId)) {
       const info = (await worlds.get(worldId)).sourceInfo;
@@ -397,14 +493,18 @@ export function registerIpc(getWindow: () => BrowserWindow | null): PythonBridge
       (r) => [r.vwgPath],
       async (out) => {
         validateDetailStats(out.stats);
+        const ent = sanitizeEntrances(out.stats.entrances);
+        out = { ...out, stats: { ...out.stats, ...(ent ? { entrances: ent } : {}) } };
         let why = 'no saved world is open (it was deleted or could not be saved), so this detail is not saved';
         if (worldId && worlds.has(worldId)) {
           try {
             const buildingName = await worlds.buildingName(worldId, params.ref.buildingId);
             const saved = await worlds.saveDetail({ worldId, params, stats: out.stats, vwgPath: out.vwgPath, buildingName });
-            if (detailVwg) knownVwg.delete(resolve(detailVwg));
-            detailVwg = null;
-            rekeep();
+            if (from === 'main') {
+              if (detailVwg) knownVwg.delete(resolve(detailVwg));
+              detailVwg = null;
+              rekeep();
+            }
             send(CH.worldSaved, { world: saved.world, detail: saved.record });
             return { vwgPath: saved.vwgPath, stats: out.stats, record: saved.record };
           } catch (e) {
@@ -414,12 +514,19 @@ export function registerIpc(getWindow: () => BrowserWindow | null): PythonBridge
         }
         // Unsaved fallback: the temp result stays viewable/exportable; the renderer is told it has no `record`.
         warn('DETAIL_NOT_SAVED', why);
-        if (detailVwg) knownVwg.delete(resolve(detailVwg));
-        detailVwg = out.vwgPath;
-        knownVwg.add(resolve(out.vwgPath));
-        rekeep();
+        if (from === 'walk') {
+          // Walk jobs never touch main's scene state: the walk window alone may read this exact temp file until the walk ends.
+          walkTemp.add(resolve(out.vwgPath));
+          rekeep();
+        } else {
+          if (detailVwg) knownVwg.delete(resolve(detailVwg));
+          detailVwg = out.vwgPath;
+          knownVwg.add(resolve(out.vwgPath));
+          rekeep();
+        }
         return { vwgPath: out.vwgPath, stats: out.stats };
       },
+      from,
     );
   });
 
@@ -469,8 +576,11 @@ export function registerIpc(getWindow: () => BrowserWindow | null): PythonBridge
     return { photoPath, previewUrl };
   });
 
-  handle(CH.readBuildingIndex, async (p: string) => {
-    if (typeof p !== 'string' || !(await trustedIndex(p))) throw new Error('BAD_REQUEST: unknown building index path');
+  /** The walk window may only read files of its own world. */
+  const inWalkWorld = (p: string): boolean => !!walkWorldId && isInside(join(worldsRoot, walkWorldId), resolve(p));
+
+  handleFrom(CH.readBuildingIndex, async (from, p: string) => {
+    if (typeof p !== 'string' || (from === 'walk' && !inWalkWorld(p)) || !(await trustedIndex(p))) throw new Error('BAD_REQUEST: unknown building index path');
     let st;
     try {
       st = await stat(p);
@@ -487,12 +597,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null): PythonBridge
     return validateBuildingIndex(parsed);
   });
 
-  handle(CH.cancel, () => {
-    if (!currentJob) return;
-    abandoned.add(currentJob);
-    bridge.cancel(currentJob);
-    cancelJob?.();
-  });
+  handle(CH.cancel, () => cancelCurrent());
 
   handle(CH.exportAs, async (format: ExportFormat, suggestedName: string, vwgPath?: string) => {
     const spec = FORMATS[format];
@@ -535,8 +640,10 @@ export function registerIpc(getWindow: () => BrowserWindow | null): PythonBridge
     }
   });
 
-  handle(CH.readVwg, async (vwgPath: string) => {
-    if (typeof vwgPath !== 'string' || !(await trustedVwg(vwgPath))) {
+  handleFrom(CH.readVwg, async (from, vwgPath: string) => {
+    // walk window: its own world's files, or the exact temp result of one of its own unsaved details
+    const walkTempOk = from === 'walk' && typeof vwgPath === 'string' && walkTemp.has(resolve(vwgPath));
+    if (typeof vwgPath !== 'string' || (!walkTempOk && ((from === 'walk' && !inWalkWorld(vwgPath)) || !(await trustedVwg(vwgPath))))) {
       throw new Error('BAD_REQUEST: unknown .vwg path');
     }
     let buf;
@@ -545,7 +652,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null): PythonBridge
     } catch {
       throw new Error('WORLD_NOT_FOUND: that scene file no longer exists');
     }
-    exportVwg = resolve(vwgPath); // the renderer is showing this scene; export defaults to it
+    if (from === 'main') exportVwg = resolve(vwgPath); // the renderer is showing this scene; export defaults to it
     return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer;
   });
 
@@ -564,26 +671,56 @@ export function registerIpc(getWindow: () => BrowserWindow | null): PythonBridge
   });
   handle(CH.renameWorld, (id: string, name: string) => {
     busyGuard();
-    return worlds.rename(id, name);
+    return worlds.rename(id, name, noWalk);
   });
   handle(CH.deleteWorld, async (id: string) => {
     busyGuard();
-    await worlds.deleteWorld(id);
+    await worlds.deleteWorld(id, noWalk);
     // The scene on screen (already in renderer memory) stays usable, but nothing more is saved into the deleted world:
     // later detail results come back without `record` plus a DETAIL_NOT_SAVED warning event.
     if (currentWorldId === id) currentWorldId = null;
   });
   // Detail calls are explicit about the world; ids are validated and must exist in the library.
-  handle(CH.listDetails, (worldId: string) => worlds.listDetails(libWorld(worldId)));
-  handle(CH.openDetail, async (worldId: string, detailId: string) => {
+  handleFrom(CH.listDetails, (from, worldId: string) => {
+    if (from === 'walk') walkWorld(worldId, true);
+    return worlds.listDetails(libWorld(worldId));
+  });
+  handleFrom(CH.openDetail, async (from, worldId: string, detailId: string) => {
+    if (from === 'walk') walkWorld(worldId, true);
     const { record, vwgPath } = await worlds.openDetail(libWorld(worldId), detailId);
     return { vwgPath, stats: record.stats, record }; // trusted by library location (see libraryKind)
   });
   handle(CH.deleteDetail, async (worldId: string, detailId: string) => {
     busyGuard();
-    const world = await worlds.deleteDetail(libWorld(worldId), detailId);
+    const world = await worlds.deleteDetail(libWorld(worldId), detailId, noWalk);
     send(CH.worldSaved, { world });
   });
+
+  // ── Walking demo ──
+  handle(CH.startWalk, async (worldId: string, spawn?: { x: number; z: number }) => {
+    await prepareWalk(
+      {
+        isValid: isValidId,
+        has: (id) => worlds.has(id),
+        busyReason: () =>
+          walk.active ? 'a walking view is already open' : currentJob ? 'a generation or detail job is running; wait for it to finish or cancel it' : '',
+        open: (id, inSlot) => worlds.open(id, inSlot),
+      },
+      worldId,
+      spawn,
+      (session) => walk.begin(session), // inside the library queue slot (BUSY if it raced with another start)
+    );
+  });
+  handle(CH.walkActive, () => walk.active);
+  handle(CH.walkFocus, () => walk.focus());
+  handle(CH.walkSession, async (): Promise<WalkSession> => {
+    if (!walkSessionData) throw new Error('BAD_REQUEST: no walking view is open');
+    // Fresh details list (the walk may have generated some since it opened): world meta from the library.
+    const world = worlds.has(walkSessionData.world.id) ? await worlds.get(walkSessionData.world.id) : walkSessionData.world;
+    return { ...walkSessionData, world };
+  });
+  handle(CH.endWalk, () => walk.end('endWalk'));
+  handle(CH.walkExit, () => walk.end('exit from the main window'));
 
   // ── Geodata (Geofabrik extracts) ──
   handle(CH.listGeodataRegions, (opts?: { refresh?: boolean }) => geodata.listRegions({ refresh: !!opts?.refresh }));
@@ -601,5 +738,5 @@ export function registerIpc(getWindow: () => BrowserWindow | null): PythonBridge
 
   // Warm up python so the first Generate is fast; failures surface on first request.
   bridge.ensureReady().catch((e: Error) => send(CH.log, `[bridge] ${e.message}`));
-  return bridge;
+  return { bridge, endWalk: (reason) => walk.end(reason), isWalkSender: (id) => walk.isWalkSender(id) };
 }

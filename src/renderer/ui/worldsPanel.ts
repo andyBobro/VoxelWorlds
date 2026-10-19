@@ -10,6 +10,8 @@ export interface WorldsHooks {
   openWorld(meta: WorldMeta): Promise<void>;
   loadParams(meta: WorldMeta): void;
   openDetail(rec: DetailRecord): Promise<void>;
+  /** opens the walking window for this saved world */
+  walk(meta: WorldMeta): Promise<void>;
   /** a world was deleted from disk (main decides what to do when it is the one on screen) */
   onWorldDeleted(meta: WorldMeta): void;
   /** non-empty = actions that change the backend state are disabled with this reason */
@@ -122,6 +124,10 @@ export class WorldsPanel {
       stat('Voxels', row.voxels), stat('Buildings', row.buildings), stat('Details', String(row.details)), stat('Size', row.size));
 
     const open = h('button', { class: 'primary wl-open', text: loading ? 'Opening...' : isCur ? 'Reopen' : 'Open', type: 'button', disabled: !!busy || loading });
+    const noVox = !(w.stats?.voxelCount > 0);
+    const walkBtn = h('button', { text: 'Walk', class: 'wl-walk', type: 'button', disabled: !!busy || loading || noVox });
+    walkBtn.title = busy || (noVox ? 'This world has no voxels to walk on' : 'Walk through this world in a new window');
+    walkBtn.addEventListener('click', () => void this.hooks.walk(w));
     const load = h('button', { text: 'Load parameters', type: 'button', title: 'Fill the Generate form with this world’s settings' });
     const ren = h('button', { text: 'Rename', type: 'button' });
     const del = h('button', { text: 'Delete', class: 'danger', type: 'button', disabled: !!busy || loading });
@@ -136,7 +142,7 @@ export class WorldsPanel {
       this.renaming?.id === w.id && this.renaming.error ? h('div', { class: 'field-error wl-err', text: this.renaming.error }) : null,
       h('div', { class: 'muted wl-meta', text: `${row.date} · centre ${row.centre} · voxel ${row.voxelSize}${w.sourceInfo ? ` · Extract from ${w.sourceInfo.sourceDate ? fmtDate(w.sourceInfo.sourceDate).slice(0, 10) : 'unknown date'}` : ''}` }),
       stats,
-      h('div', { class: 'row buttons wl-actions' }, open, load, ren, del),
+      h('div', { class: 'row buttons wl-actions' }, open, walkBtn, load, ren, del),
     );
     card.dataset.world = w.id;
     if ((isCur ? this.session.details : w.details ?? []).length > 0) card.append(this.detailsBlock(w, isCur, busy));
