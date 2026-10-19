@@ -185,7 +185,8 @@ class DetailTests(unittest.TestCase):
         sink = Sink()
         mv = kw.pop("maxVoxels", 20_000_000)
         gdf_fn = kw.pop("gdf_fn", synthetic_gdf)
-        p = dict(ref=dict(bbox=BBOX, buildingId=bid), voxelSize=vs, maxVoxels=mv, **kw)
+        ref_extra = kw.pop("ref_extra", dict(cityVoxelSize=1.0, cityBaseY=1))
+        p = dict(ref=dict(bbox=BBOX, buildingId=bid, **ref_extra), voxelSize=vs, maxVoxels=mv, **kw)
         if facade:
             p["facade"] = dict(edge=0, spec=self.SPEC)
         with mock.patch("voxelworlds.osm.fetch.fetch_features", lambda *a, **k: gdf_fn()), \

@@ -35,6 +35,7 @@ export class PreviewHost {
   private hl: HighlightSpec | null = null;
   private markers: readonly BuildingInfo[] | null = null;
   private markersVisible = true;
+  private paused = false;
 
   /** Click-pick callback (survives remounts). */
   set onPick(cb: ((hit: SurfaceHit | null) => void) | null) {
@@ -61,6 +62,13 @@ export class PreviewHost {
   showDetail(buf: ArrayBuffer): void { this.handle?.showDetail(buf); this.container.querySelector('canvas')?.focus({ preventScroll: true }); }
   backToCity(): void { this.handle?.backToCity(); this.container.querySelector('canvas')?.focus({ preventScroll: true }); }
   setCutaway(slabY: number | null): void { this.handle?.setCutaway(slabY); }
+  /** Stop / resume the render loop (walking window open: the GPU belongs to it). Survives remounts. */
+  setPaused(p: boolean): void {
+    this.paused = p;
+    this.handle?.setPaused(p);
+  }
+  /** City voxel [x, z] under the view, for "Walk here"; null when unknown (no city, or a detail scene is shown). */
+  viewSpot(): { x: number; z: number } | null { return this.handle?.getViewSpot() ?? null; }
   setCameraMode(m: 'orbit' | 'fly'): void { this.handle?.setCameraMode(m); }
 
   constructor(private container: HTMLElement) {
@@ -77,7 +85,7 @@ export class PreviewHost {
             (t.tagName === 'INPUT' && !/^(checkbox|radio|button)$/.test((t as HTMLInputElement).type)))
         )
           return;
-        if (!this.handle || this.container.offsetParent === null) return;
+        if (!this.handle || this.paused || this.container.offsetParent === null) return;
         e.stopPropagation();
         e.preventDefault();
         this.setAmbientOcclusion(!this.ao);
@@ -121,6 +129,7 @@ export class PreviewHost {
       this.handle = h;
     }
     this.handle.onPick = this.pickCb;
+    this.handle.setPaused(this.paused);
     this.handle.load(buf);
     this.hl = null;
     this.handle.setMarkersVisible(this.markersVisible);

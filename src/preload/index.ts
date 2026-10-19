@@ -20,6 +20,22 @@ async function job<T>(channel: string, ...args: unknown[]): Promise<T> {
   return res as T;
 }
 
+/** onWalkState: fires immediately with the current value, then on every change (an event that beats the initial query wins). */
+function onWalkState(cb: (active: boolean) => void): () => void {
+  let got = false;
+  const un = subscribe<boolean>(CH.walkState, (a) => {
+    got = true;
+    cb(!!a);
+  });
+  void job<boolean>(CH.walkActive).then(
+    (a) => {
+      if (!got) cb(!!a);
+    },
+    () => undefined,
+  );
+  return un;
+}
+
 const api: VoxelApi = {
   generate: (params) => job(CH.generate, params),
   cancel: () => job(CH.cancel),
@@ -34,6 +50,10 @@ const api: VoxelApi = {
   listDetails: (worldId) => job(CH.listDetails, worldId),
   openDetail: (worldId, detailId) => job(CH.openDetail, worldId, detailId),
   deleteDetail: (worldId, detailId) => job(CH.deleteDetail, worldId, detailId),
+  startWalk: (worldId, spawn) => job(CH.startWalk, worldId, spawn),
+  onWalkState,
+  walkSession: () => job(CH.walkSession),
+  endWalk: () => job(CH.endWalk),
   onWorldSaved: (cb) => subscribe(CH.worldSaved, cb),
   listGeodataRegions: (opts) => job(CH.listGeodataRegions, opts),
   suggestGeodataRegions: (bbox) => job(CH.suggestGeodataRegions, bbox),
@@ -49,5 +69,9 @@ const api: VoxelApi = {
   onWarning: (cb) => subscribe(CH.warning, cb),
   onLog: (cb) => subscribe(CH.log, cb),
 };
+
+// Main-window-only helper (not in the frozen VoxelApi): focus the walking window. Main rejects it from any other sender.
+(api as unknown as Record<string, unknown>).focusWalk = () => job(CH.walkFocus);
+(api as unknown as Record<string, unknown>).exitWalk = () => job(CH.walkExit);
 
 contextBridge.exposeInMainWorld('voxel', api);

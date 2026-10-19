@@ -52,6 +52,10 @@ export interface PreviewHandle {
   onContextLost: (() => void) | null;
   /** True when the city scene stopped meshing at the GPU memory budget (outer chunks not shown). */
   isTruncated(): boolean;
+  /** Stops (true) / restarts (false) the render loop, e.g. while another window owns the GPU. State and scene are kept. */
+  setPaused(paused: boolean): void;
+  /** City voxel [x, z] under the view (orbit: the orbit target, fly: the camera); null in a detail scene. For "walk here". */
+  getViewSpot(): { x: number; z: number } | null;
 }
 
 export interface MountOptions {
@@ -378,7 +382,7 @@ function mountWith(container: HTMLElement, renderer: THREE.WebGLRenderer, ropts:
   let fps = 0;
   let hudT = 0;
 
-  renderer.setAnimationLoop((now: number) => {
+  const frame = (now: number): void => {
     const dt = Math.min((now - lastT) / 1000, 0.25);
     lastT = now;
     // Adaptive slice: shrink when the previous frame ran long so meshing never starves rendering.
@@ -417,7 +421,9 @@ function mountWith(container: HTMLElement, renderer: THREE.WebGLRenderer, ropts:
         geoMB: s ? s.geometryBytes / 1048576 : 0,
       });
     }
-  });
+  };
+  renderer.setAnimationLoop(frame);
+  let paused = false;
 
   const applyHighlight = (): void => {
     if (!cityWorld) return;
@@ -442,6 +448,21 @@ function mountWith(container: HTMLElement, renderer: THREE.WebGLRenderer, ropts:
     get onContextLost() { return onContextLostCb; },
     set onContextLost(cb) { onContextLostCb = cb; },
     isTruncated: () => cityWorld?.stats.truncated ?? false,
+    setPaused(p: boolean): void {
+      if (disposed || p === paused) return;
+      paused = p;
+      if (p) renderer.setAnimationLoop(null);
+      else {
+        lastT = performance.now(); // no huge dt after the pause
+        renderer.setAnimationLoop(frame);
+      }
+    },
+    getViewSpot(): { x: number; z: number } | null {
+      if (detail || !cityWorld) return null;
+      const vs = cityWorld.voxelSize;
+      const p = rig.mode === 'orbit' ? rig.orbit.target : camera.position;
+      return Number.isFinite(p.x + p.z) && vs > 0 ? { x: p.x / vs, z: p.z / vs } : null;
+    },
     get onPick() { return onPickCb; },
     set onPick(cb) { onPickCb = cb; syncCrosshair(); },
 

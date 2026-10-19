@@ -106,6 +106,12 @@ describe('friendlyPreviewError', () => {
   it('leaves other errors untouched', () => {
     expect(friendlyPreviewError('VWG: bad magic', 1)).toBe('VWG: bad magic');
   });
+  it('does not blame a small world: only advises reloading', () => {
+    const t = friendlyPreviewError('WebGL context lost', 1, 1_000_000);
+    expect(t).toMatch(/Reload preview/);
+    expect(t).not.toMatch(/voxel size|very large/);
+    expect(friendlyPreviewError('WebGL context lost', 1, 40_000_000)).toMatch(/larger voxel size/);
+  });
   it('works without a voxel size', () => {
     expect(friendlyPreviewError('WebGL context lost')).toMatch(/larger voxel size/);
   });

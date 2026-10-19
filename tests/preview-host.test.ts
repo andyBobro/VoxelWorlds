@@ -15,7 +15,7 @@ vi.mock('../src/renderer/preview', () => ({
     if (state.failNext) { state.failNext = false; throw new Error('THREE.WebGLRenderer: Error creating WebGL context.'); }
     const h = {
       disposed: false, onContextLost: null as (() => void) | null, onPick: null,
-      load() {}, dispose() { h.disposed = true; }, setMarkers() {}, setMarkersVisible() {}, setHighlight() {},
+      load() {}, dispose() { h.disposed = true; }, setMarkers() {}, setMarkersVisible() {}, setHighlight() {}, setPaused() {}, getViewSpot() { return null; },
       getAmbientOcclusion: () => ({ on: false, available: false }), setAmbientOcclusion: () => false,
     };
     state.handles.push(h);

@@ -120,10 +120,18 @@ export function geometryBytes(vertexCount: number, indexCount: number, indexByte
   return vertexCount * BYTES_PER_VERTEX + indexCount * indexBytes;
 }
 
-/** Human, actionable text for a preview failure. `voxelSize` in metres when known. */
-export function friendlyPreviewError(raw: string, voxelSize?: number | null): string {
+/**
+ * Human, actionable text for a preview failure. `voxelSize` in metres and `voxels` (scene voxel count) when known.
+ * A small scene (< MEDIUM_VOXELS) cannot have run the GPU out of memory by itself, so it is not blamed on size: the
+ * graphics process stopped (driver reset, another app, sleep) and reloading is the advice. Unknown size keeps the
+ * conservative advice.
+ */
+export function friendlyPreviewError(raw: string, voxelSize?: number | null, voxels?: number | null): string {
   const m = raw.replace(/^Error:\s*/, '');
   if (/WebGL|context/i.test(m)) {
+    if (voxels !== undefined && voxels !== null && voxels > 0 && voxels < MEDIUM_VOXELS) {
+      return `${m}. The graphics process stopped unexpectedly. Press "Reload preview".`;
+    }
     const hint = voxelSize && voxelSize > 0
       ? ` Generate a smaller area or use a larger voxel size (currently ${voxelSize} m; try ${+(voxelSize * 2).toFixed(2)} m).`
       : ' Generate a smaller area or use a larger voxel size.';

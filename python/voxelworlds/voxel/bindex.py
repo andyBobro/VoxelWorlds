@@ -77,3 +77,29 @@ def write_index(path: str, index: dict) -> None:
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
+
+
+def _city_key(bbox: dict, vs) -> str:
+    return "cityinfo|%.6f,%.6f,%.6f,%.6f|%s" % (bbox["lonMin"], bbox["latMin"], bbox["lonMax"], bbox["latMax"],
+                                              "latest" if vs is None else "%.6f" % float(vs))
+
+
+def remember_city(bbox: dict, vs: float, index: dict) -> None:
+    """Cache {voxel size, baseY per building id} of a generate run so a later 'detail' request (which only knows the
+    bbox) can place its entrances in the city grid. Best effort; the result files are not affected."""
+    from .. import cache
+    obj = {"vs": float(vs), "base": {e["id"]: int(e["baseY"]) for e in index.get("buildings", [])}}
+    for key in (_city_key(bbox, vs), _city_key(bbox, None)):
+        cache.put_obj("cityinfo", key, obj)
+
+
+def lookup_city(bbox: dict, vs, building_id: str):
+    """-> (city voxel size, baseY) from the cache (the run for `vs` if given, else the latest one) or None."""
+    from .. import cache
+    try:
+        obj = cache.get_obj("cityinfo", _city_key(bbox, vs), 10 * 365 * 86400)
+        if not obj or building_id not in obj["base"]:
+            return None
+        return float(obj["vs"]), int(obj["base"][building_id])
+    except Exception:
+        return None

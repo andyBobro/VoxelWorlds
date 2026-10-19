@@ -73,6 +73,15 @@ button:disabled { opacity: .4; cursor: not-allowed; }
 .tabpane.active { display: block; }
 #map { position: absolute; inset: 0; background: #0e1013; }
 #preview-container { position: absolute; inset: 0; }
+#walk-here { position: absolute; left: 8px; top: 80px; z-index: 6; padding: 5px 12px; font-size: 12px; }
+#walk-here:disabled { opacity: .55; cursor: default; }
+#walk-lock { position: fixed; inset: 0; z-index: 3000; display: flex; align-items: center; justify-content: center;
+  background: rgba(10,12,15,.82); backdrop-filter: blur(2px); }
+#walk-lock[hidden] { display: none; }
+.walk-lock-box { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 24px 32px; max-width: 460px; text-align: center; }
+.walk-lock-box h2 { margin: 0 0 8px; font-size: 18px; }
+.walk-lock-box .buttons { justify-content: center; margin-top: 14px; }
+.map-locked { cursor: not-allowed !important; }
 #ao-toggle { position: absolute; left: 8px; top: 112px; z-index: 6; display: flex; align-items: center; gap: 6px;
   font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace; color: #fff; background: rgba(0,0,0,.55);
   padding: 5px 9px; border-radius: 5px; user-select: none; cursor: pointer; }

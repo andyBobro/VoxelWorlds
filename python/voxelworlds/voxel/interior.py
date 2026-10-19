@@ -9,7 +9,9 @@ Inputs (see detail_scene.py): ``building.poly/base_y/eave_y/kind/btype/entrances
 ``levels, floor_ys, openings, wall_t`` and the optional ``check`` (cancel hook, called often), ``max_voxels``
 (budget left after the exterior) and ``warnings`` (list of (code, message) the caller emits as warnings).
 Outputs written back on ``building.detail``: ``rooms`` (number of rooms, circulation not counted), ``doors_added``
-(entrance door painted because the facade had none), ``interior_plan`` (door graph etc. for tests/UI).
+(entrance door painted because the facade had none), ``interior_plan`` (door graph etc. for tests/UI) and
+``entrances_raw`` (walking demo: per usable ground-floor door the feet positions inside/outside in metres of the
+detail .vwg frame, see ``compute_entrances``; metadata only, no voxel depends on it).
 
 Method
   * Wall depth D = max(wall thickness, painted wall_t) voxels. The free interior is the footprint raster eroded D
@@ -50,6 +52,8 @@ from ..tiles import M as _M
 MW, MO = _M["wall"], _M["other"]
 
 _GEOS_ERR = (shapely.errors.GEOSException, ValueError, ZeroDivisionError)
+_RETRY = object()      # _paint_once result: repaint (a repair round widened the doorways)
+DISC_CHECK_MAX_CELLS = 400_000   # footprints (cells) above this skip the disc reachability validation
 
 
 def _guard(default):
@@ -67,9 +71,12 @@ def _guard(default):
 
 
 DOOR_W, DOOR_H = 0.9, 2.0
+DOOR_EXTRA_MAX = 0.6   # interior doorways are widened by up to this much (0.2 per repair round) if a 0.6 m disc cannot reach a room
+DOOR_APPROACH = 1.2   # m beyond the `outside` point where a painted threshold step in front of a facade door is cleared too
 PART_T = 0.1          # partition thickness (m)
 SLAB_T = 0.2          # slab thickness (m)
-STAIR_W = 0.95        # stair lane width (m)
+STAIR_W = 1.0         # minimum stair lane width (m); see stair_lane_w()
+STAIR_HEAD = 2.5      # vertical clear height above every tread (m): a 1.8 m, 0.6 m deep body on a 45 degree ramp needs 2.4
 APRON = 1.5           # open floor in front of / behind stairs (m)
 SHOP_TYPES = {"retail", "shop", "supermarket", "mall", "kiosk", "restaurant", "cafe", "bank"}
 SINGLE_LEVEL_KINDS = {"religious", "industrial", "minor"}   # tall open volume: ground slab only
@@ -268,6 +275,9 @@ class _Builder:
         self.door_rows = max(1, int(round(DOOR_H / vs)))
         self.zone_m = max(1, int(math.ceil(0.15 / vs)))
         self.hw_part = 0.5 * PART_T
+        self.stair_w = stair_lane_w(vs)
+        self.no_fix = False        # repair: no fixtures at all
+        self.door_extra = 0.0      # repair: extra interior door width (m), see _unreachable_rooms
 
     # ---- helpers
     def limit_message(self, interior_voxels: int) -> str:
@@ -351,6 +361,7 @@ class _Builder:
         bd, det, grid, vs = self.bd, self.det, self.grid, self.vs
         det.rooms = 0
         det.interior_plan = None
+        det.entrances_raw = []
         eave, base = bd.eave_y, bd.base_y
         if eave is None or getattr(bd, "lattice", False) or getattr(bd, "open_structure", False) or bd.poly.is_empty:
             return _empty()
@@ -678,7 +689,7 @@ class _Builder:
         aprons = [box_ab(-APRON, 0.0, 0.0, Wb)]
         if kind == "S":
             aprons.append(box_ab(La, La + APRON, 0.0, Wb))
-        return dict(kind=kind, steep=steep, tr=tr, n=n, nA=nA if kind == "U" else n, La=La, Wb=Wb, sw=STAIR_W,
+        return dict(kind=kind, steep=steep, tr=tr, n=n, nA=nA if kind == "U" else n, La=La, Wb=Wb, sw=self.stair_w,
                     rect=rect, o=o, ea=ea, eb=eb, axis=axis, direction=direction, body=box_ab(0.0, La, 0.0, Wb),
                     aprons=aprons)
 
@@ -700,6 +711,19 @@ class _Builder:
         m = (a >= 0) & (a < sp["La"]) & (b >= 0) & (b < sp["Wb"])
         m &= self.free[rr, cc]
         return rr[m], cc[m], a[m], b[m]
+
+    def spine_cells(self, sp, a, b):
+        """(rows, cols) of the wall between the two lanes of a U stair: the cells within a wall thickness of the lane
+        boundary b = sw, from the foot (a = 0) to the start of the landing; empty for straight stairs."""
+        if sp["kind"] != "U":
+            return np.empty(0, np.int64), np.empty(0, np.int64)
+        nu, nv = sp["eb"]
+        nx = nu * self.cs - nv * self.sn
+        nz_ = nu * self.sn + nv * self.cs
+        hw = max(self.hw_part, 0.5 * self.vs * (abs(nx) + abs(nz_))) + 1e-6
+        m = (np.abs(b - sp["sw"]) <= hw) & (a >= 0) & (a < sp["La"] - sp["sw"])
+        rr, cc, _, _ = self.stair_cells(sp)
+        return rr[m], cc[m]
 
     def step_index(self, sp, a, b):
         """step number k (1..n) per cell, 0 = no step."""
@@ -963,7 +987,7 @@ class _Builder:
 
     def _stair_options(self, n: int):
         vs = self.vs
-        sw = STAIR_W
+        sw = self.stair_w
         options = []
         for steep in (False, True):
             tr = 0.28 if not steep else 0.2
@@ -1644,6 +1668,8 @@ class _Builder:
         """Rasterise the plans; if the result exceeds the voxel budget, drop fixtures, then partitions, and retry."""
         while True:
             res = self._paint_once()
+            if res is _RETRY:
+                continue
             if res is not None:
                 break
             self.simp += 1
@@ -1698,6 +1724,27 @@ class _Builder:
             rooms_total = sum(pp["n"] for pp in self.parts_plan)
         self.det.rooms = rooms_total
         self.det.doors_added = int(self._painted_doors)
+        if self.simp < 2 and self.n_free <= DISC_CHECK_MAX_CELLS and len(plan_levels) and self.max_levels_checked():
+            try:
+                bad = self._unreachable_rooms(xyz, plan_levels)
+            except Exception as e:      # validation must never fail the interior
+                log(f"interior: disc reachability check failed ({type(e).__name__}: {e})")
+                bad = []
+            if bad and self.door_extra < DOOR_EXTRA_MAX - 1e-9:
+                self.door_extra = round(self.door_extra + 0.2, 2)
+                return _RETRY
+            if bad and not self.no_fix and self.simp < 1:       # last repair: leave the rooms unfurnished
+                self.no_fix = True
+                self.warnings.append(("INTERIOR_SIMPLIFIED", "Furniture left out so every room can be entered"))
+                return _RETRY
+            if bad:
+                self.warnings.append(("ROOM_UNREACHABLE", f"{len(bad)} room(s) cannot be entered by a 0.6 m wide "
+                                      "body (narrow or jagged doorways); they are left as they are"))
+        try:
+            self.det.entrances_raw = self.compute_entrances(xyz)
+        except Exception as e:      # metadata only: never fail the interior because of it
+            log(f"interior: entrances failed ({type(e).__name__}: {e})")
+            self.det.entrances_raw = []
         built = max(pp["n"] for pp in self.parts_plan)
         self.det.levels_built = built
         self.det.floor_ys_built = list(self.fy[:built])
@@ -1710,6 +1757,287 @@ class _Builder:
                                                  vs=vs, simplified=self.simp, D=self.D, x0=self.x0, z0=self.z0,
                                                  free=self.free, zones=self.zones)
         return xyz, codes
+
+    # -- disc reachability (the walking client is a 0.6 m wide disc): validate the final voxels of every storey
+    def max_levels_checked(self) -> bool:
+        return len(self.fy) <= 12
+
+    def _unreachable_rooms(self, xyz: np.ndarray, plan_levels: list) -> list:
+        """-> [(part, level, room)] of rooms (not stairs / lifts) that a 0.6 m disc standing on the storey floor cannot
+        reach from the room the storey is entered from (entrance room on the ground floor, the stair hall above). The
+        disc rests on the highest voxel under its footprint, needs 1.8 m clear above and moves in 8 directions (no
+        squeezing between two diagonal corners)."""
+        vs = self.vs
+        head = int(math.ceil(1.8 / vs - 1e-9))
+        R = 0.3 - 1e-6
+        n = int(math.ceil(R / vs)) + 1
+        offs = []
+        for dx in range(-n, n + 1):
+            for dz in range(-n, n + 1):
+                ax, az = max(abs(dx) * vs - vs / 2, 0.0), max(abs(dz) * vs - vs / 2, 0.0)
+                if ax * ax + az * az < R * R:
+                    offs.append((dx, dz))
+        m = n + 1
+        H, W = self.h + 2 * m, self.w + 2 * m
+        A = np.asarray(xyz, np.int64).reshape(-1, 3)
+        shell = [getattr(self.bd, k, None) for k in ("wx", "wy", "wz")]
+        shell = np.column_stack([np.asarray(a, np.int64) for a in shell]) if all(a is not None and len(a) for a in shell) \
+            else np.empty((0, 3), np.int64)
+        bad = []
+
+        def shifted(a, dx, dz):
+            out = np.zeros_like(a)
+            xs0, xs1, zs0, zs1 = max(0, dz), H + min(0, dz), max(0, dx), W + min(0, dx)
+            out[xs0:xs1, zs0:zs1] = a[xs0 - dz:xs1 - dz, zs0 - dx:zs1 - dx]
+            return out
+
+        def dilate(a):
+            o = np.zeros_like(a)
+            for dx, dz in offs:
+                o |= shifted(a, dx, dz)
+            return o
+        for L in range(min(len(self.fy), max(len(p["levels"]) for p in plan_levels))):
+            y = self.fy[L] + 1
+            blocked = np.zeros((H, W), bool)
+            below = np.zeros((H, W), bool)
+            for D_ in (A, shell):
+                if not len(D_):
+                    continue
+                sel = (D_[:, 1] >= y - 1) & (D_[:, 1] < y + head)
+                B = D_[sel]
+                col = B[:, 0] - self.x0 + m
+                row = B[:, 2] - self.z0 + m
+                ok = (col >= 0) & (col < W) & (row >= 0) & (row < H)
+                B, col, row = B[ok], col[ok], row[ok]
+                up = B[:, 1] >= y
+                blocked[row[up], col[up]] = True
+                below[row[~up], col[~up]] = True
+            S = dilate(below) & ~dilate(blocked)
+            for pi, pp in enumerate(plan_levels):
+                if L >= len(pp["levels"]):
+                    continue
+                lv = pp["levels"][L]
+                rooms = lv["rooms"]
+                if not rooms:
+                    continue
+                er = lv["entrance_room"] if 0 <= lv["entrance_room"] < len(rooms) else 0
+                seed_poly = rooms[er]["poly_uv"]
+                pt = seed_poly.buffer(-0.25).representative_point() if not seed_poly.buffer(-0.25).is_empty \
+                    else seed_poly.representative_point()
+                if L == 0 and pp.get("ent_in") is not None:
+                    pt = Point(*pp["ent_in"])
+                E, N = self.world(pt.x, pt.y)
+                c0 = int(math.floor((E - self.grid.e0) / vs)) - self.x0 + m
+                r0 = int(math.floor((self.grid.n0 - N) / vs)) - self.z0 + m
+                seed = None
+                for rad in range(0, int(0.6 / vs) + 2):
+                    cand = [(r0 + a, c0 + b) for a in range(-rad, rad + 1) for b in range(-rad, rad + 1)
+                            if 0 <= r0 + a < H and 0 <= c0 + b < W and S[r0 + a, c0 + b]]
+                    if cand:
+                        seed = min(cand, key=lambda t: (abs(t[0] - r0) + abs(t[1] - c0), t))
+                        break
+                reached = np.zeros((H, W), bool)
+                if seed is None:
+                    seed_ok = False
+                else:
+                    seed_ok = True
+                    reached[seed] = True
+                    front = reached.copy()
+                    while front.any():
+                        new = np.zeros_like(front)
+                        for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)):
+                            f = front
+                            if dx and dz:       # no squeezing between two diagonal corners
+                                f = front & (shifted(S, -dx, 0) | shifted(S, 0, -dz))
+                            new |= shifted(f, dx, dz)
+                        new &= S & ~reached
+                        reached |= new
+                        front = new
+                for ri, r in enumerate(rooms):
+                    if r["type"] in ("stairs", "lift"):
+                        continue
+                    poly = r["poly_uv"].buffer(-0.25)
+                    if poly.is_empty:
+                        poly = r["poly_uv"].buffer(-0.1)
+                    if poly.is_empty:
+                        continue
+                    mask = np.zeros((self.h, self.w), bool)
+                    self._poly_mask(poly, mask)
+                    if not mask.any():
+                        continue
+                    if not seed_ok or not (reached[m:m + self.h, m:m + self.w] & mask).any():
+                        bad.append((pi, L, ri))
+        return bad
+
+    # -- walking demo: entrances (metadata only; never changes a voxel)
+    def _opening_door_for(self, pt):
+        """the painted facade door opening whose centre is nearest to world point pt (or None)."""
+        best = None
+        for o in self.openings:
+            if o.get("kind") != "door":
+                continue
+            E = self.grid.e0 + 0.5 * (o["x0"] + o["x1"]) * self.vs
+            N = self.grid.n0 - 0.5 * (o["z0"] + o["z1"]) * self.vs
+            d = math.hypot(E - pt[0], N - pt[1])
+            if best is None or d < best[0]:
+                best = (d, o)
+        return best[1] if best else None
+
+    def compute_entrances(self, xyz: np.ndarray) -> list:
+        """One record per usable door of the ground floor: ``dict(pt (E,N) of the door on the outline, n_in (E,N)
+        unit, inside/outside = feet [x, y, z] in metres of the detail .vwg frame (voxel index * voxel size, cell
+        centres), dir = [x, z] outside->inside, widthM, kind)``. Candidates are verified against the final voxels
+        (interior + exterior shell): walkable floor, >= 2 m headroom and a 0.6 m wide clear column. Doors that do
+        not lead from outside into a walkable space are skipped (warning ENTRANCE_UNUSABLE)."""
+        vs, grid = self.vs, self.grid
+        fy0 = int(self.fy[0])
+        y = fy0 + 1                                  # feet row (the floor voxel is fy0)
+        r = int(0.3 / vs + 1e-9)                     # 0.6 m wide body: cell offsets -r..r
+        hr_full = int(math.ceil(2.0 / vs - 1e-9))
+        hr_min = int(math.ceil(1.85 / vs - 1e-9))
+        hr_out = int(math.ceil(1.8 / vs - 1e-9))
+        ceil_row = int(self.top_rows[0])             # last free row below the first slab (inclusive)
+        members = list(getattr(self.det, "members", None) or [self.bd])
+        union = unary_union([m.poly for m in members if m.poly is not None and not m.poly.is_empty]).buffer(0.02)
+        xyz = np.asarray(xyz).reshape(-1, 3)
+        shell = [np.asarray(getattr(self.bd, k, None) if getattr(self.bd, k, None) is not None else [], np.int64)
+                 for k in ("wx", "wy", "wz")]
+        shell = np.column_stack(shell) if len(shell[0]) else np.empty((0, 3), np.int64)
+        ents = [pp["ent"] for pp in self.parts_plan] + [e for pp in self.parts_plan for e in pp["exits"]]
+        out: list = []
+        loc: list = [xyz, shell]
+        Hm = max(hr_full, hr_out) + 2
+        rc = int(math.ceil(1.2 / vs))                # local search window (cells around a candidate)
+        R = r + rc
+
+        def cell_of(E, N):
+            return (int(math.floor((E - grid.e0) / vs)), int(math.floor((grid.n0 - N) / vs)))
+
+        def window(cx, cz, rad):
+            """bool occupancy [x, y (rel. y-1), z] around cell (cx, cz), radius rad cells."""
+            x0, z0 = cx - rad, cz - rad
+            n = 2 * rad + 1
+            occ = np.zeros((n, Hm + 1, n), bool)
+            for A in loc:
+                if not len(A):
+                    continue
+                m = ((A[:, 0] >= x0) & (A[:, 0] < x0 + n) & (A[:, 2] >= z0) & (A[:, 2] < z0 + n)
+                     & (A[:, 1] >= y - 1) & (A[:, 1] <= y - 1 + Hm))
+                B = A[m]
+                occ[B[:, 0] - x0, B[:, 1] - (y - 1), B[:, 2] - z0] = True
+            return occ
+
+        disc = np.array([[math.hypot(a, b) * vs <= 0.3 + 1e-9 for b in range(-r, r + 1)] for a in range(-r, r + 1)])
+        knee = int(math.ceil(0.4 / vs - 1e-9))
+
+        def clear_col(occ, ix, iz, hr, need_floor):
+            """round body (radius 0.3 m) at local cell (ix, iz): the centre column is free for hr rows from the feet
+            row, the rest of the disc above a 0.4 m knee (a tread / threshold beside the centre is stepped over),
+            and there is a floor under the centre cell."""
+            sl = occ[ix - r:ix + r + 1, :, iz - r:iz + r + 1]
+            if sl.shape[0] != 2 * r + 1 or sl.shape[2] != 2 * r + 1:
+                return False
+            if sl[r, 1:1 + hr, r].any() or sl.transpose(0, 2, 1)[disc][:, 1 + knee:1 + hr].any():
+                return False
+            return not (need_floor and not sl[r, 0, r])
+
+        for ent in ents:
+            pt = (float(ent["pt_b"][0]), float(ent["pt_b"][1]))
+            n_in = (float(ent["n_in"][0]), float(ent["n_in"][1]))
+            tan = (float(ent["tan"][0]), float(ent["tan"][1]))
+            ln = math.hypot(*n_in) or 1.0
+            n_in = (n_in[0] / ln, n_in[1] / ln)
+            if ent.get("kind") == "openings":
+                o = self._opening_door_for(pt)
+                if o is None:
+                    width = 0.0
+                else:
+                    dx, dz = (o["x1"] - o["x0"]) * vs, (o["z1"] - o["z0"]) * vs
+                    width = (dx * abs(tan[0]) + dz * abs(tan[1])) / ((tan[0] ** 2 + tan[1] ** 2) or 1.0)
+                width = round(width, 3)
+            else:
+                width = round(DOOR_W, 3)
+            if width < DOOR_W - 1e-6:       # narrow (scaled) facade door: the doorway is widened to 0.9 m when carved
+                width = round(DOOR_W, 3)
+            # only the voxels near this door matter: prefilter once (the candidate loop below looks at them often)
+            ex, ez = cell_of(*pt)
+            rb = int(math.ceil((2.5 + self.D * vs) / vs)) + R + 2
+            loc = []
+            for A in (xyz, shell):
+                if len(A):
+                    m = ((np.abs(A[:, 0] - ex) <= rb) & (np.abs(A[:, 2] - ez) <= rb)
+                         & (A[:, 1] >= y - 1) & (A[:, 1] <= y - 1 + Hm))
+                    A = A[m]
+                loc.append(A)
+            inner = (self.D + 1) * vs
+            base_d = max(0.6, inner + 0.3)
+            ds = []
+            for k in (0.0, 0.1, 0.2, -0.1, 0.3, 0.4, 0.5):
+                d = round(base_d + k, 3)
+                if d >= inner + 0.15 and d not in ds:
+                    ds.append(d)
+            res_in = None
+            best = None         # fallback: the clear candidate with the most room around it
+            for hr0 in (hr_full, hr_min):
+                hr = min(hr0, ceil_row - y + 1)
+                if hr < hr_min:
+                    break
+                for d in ds:
+                    for lt in (0.0, vs, -vs, 2 * vs, -2 * vs):
+                        cx, cz = cell_of(pt[0] + n_in[0] * d + tan[0] * lt, pt[1] + n_in[1] * d + tan[1] * lt)
+                        occ = window(cx, cz, R)
+                        if not clear_col(occ, R, R, hr, True):
+                            continue
+                        # not a pocket: the clear floor connected to the cell has to reach 0.9 m away (or fill 0.5 m2)
+                        ok2 = {(ax, az) for ax in range(-rc, rc + 1) for az in range(-rc, rc + 1)
+                               if clear_col(occ, R + ax, R + az, hr, True)}
+                        seen, stack = {(0, 0)}, [(0, 0)]
+                        while stack:
+                            ax, az = stack.pop()
+                            for q in ((ax + 1, az), (ax - 1, az), (ax, az + 1), (ax, az - 1)):
+                                if q in ok2 and q not in seen:
+                                    seen.add(q)
+                                    stack.append(q)
+                        reach = max(max(abs(ax), abs(az)) for ax, az in seen)
+                        if reach * vs >= 0.9 or len(seen) * vs * vs >= 0.5:
+                            res_in = (cx, cz)
+                            break
+                        if best is None or (reach, len(seen)) > best[0]:
+                            best = ((reach, len(seen)), (cx, cz))
+                    if res_in:
+                        break
+                if res_in:
+                    break
+            if res_in is None and best is not None and best[0][1] >= 4:
+                res_in = best[1]
+            res_out = None
+            if res_in:
+                for d in (0.8, 0.7, 0.9, 0.6, 1.0):
+                    E, N = pt[0] - n_in[0] * d, pt[1] - n_in[1] * d
+                    if union.contains(Point(E, N)):
+                        continue
+                    cx, cz = cell_of(E, N)
+                    occ = window(cx, cz, r + 1)
+                    if occ[:, 1:1 + hr_out, :].any():
+                        continue
+                    res_out = (cx, cz)
+                    break
+            if not res_in or not res_out:
+                self.warnings.append(("ENTRANCE_UNUSABLE", "A door has no " + (
+                    "walkable floor behind it" if not res_in else "clear ground in front of it")
+                    + "; not used as an entrance"))
+                continue
+            (ix, iz), (ox, oz) = res_in, res_out
+            ce = lambda c, r_: (grid.e0 + (c + 0.5) * vs, grid.n0 - (r_ + 0.5) * vs)
+            d_in = (ce(ix, iz)[0] - pt[0]) * n_in[0] + (ce(ix, iz)[1] - pt[1]) * n_in[1]
+            d_out = -((ce(ox, oz)[0] - pt[0]) * n_in[0] + (ce(ox, oz)[1] - pt[1]) * n_in[1])
+            out.append(dict(
+                pt=pt, n_in=n_in, tan=tan, dIn=round(d_in, 4), dOut=round(d_out, 4), kind=ent.get("kind"),
+                widthM=width,
+                inside=[round((ix + 0.5) * vs, 4), round(y * vs, 4), round((iz + 0.5) * vs, 4)],
+                outside=[round((ox + 0.5) * vs, 4), round(y * vs, 4), round((oz + 0.5) * vs, 4)],
+                dir=[round(n_in[0], 4), round(-n_in[1], 4)]))
+        return out
 
     def raster_geom(self, g):
         """walls / door cells (2D masks) for a storey geometry; room-id raster is made per level."""
@@ -1731,7 +2059,7 @@ class _Builder:
             W[rr, cc] = True
         for d in g["doors"]:
             c, dd = d["c"], d["d"]
-            dwid = d.get("w", DOOR_W)
+            dwid = d.get("w", DOOR_W) + self.door_extra
             p = (c[0] - dd[0] * dwid / 2, c[1] - dd[1] * dwid / 2)
             q = (c[0] + dd[0] * dwid / 2, c[1] + dd[1] * dwid / 2)
             nx = abs(-dd[1] * self.cs - dd[0] * self.sn) + abs(-dd[1] * self.sn + dd[0] * self.cs)
@@ -1769,7 +2097,7 @@ class _Builder:
         hole_stair = np.zeros((self.h, self.w), bool)
         for sp in specs:
             s_rr, s_cc, s_a, s_b = self.stair_cells(sp)
-            sdata.append((sp, s_rr, s_cc, self.step_index(sp, s_a, s_b)))
+            sdata.append((sp, s_rr, s_cc, self.step_index(sp, s_a, s_b), self.spine_cells(sp, s_a, s_b)))
             hole_stair[s_rr, s_cc] = True
         lift_cells = None
         hole_lift = np.zeros((self.h, self.w), bool)
@@ -1788,6 +2116,7 @@ class _Builder:
             g = pp["geoms"][pp["styles"][L]]
             rooms = g["rooms"]
             lo, hi = self.fy[L] + 1, self.top_rows[L]
+            top_ = self.top_rows[L]
             zone = self.zone_mask(lo, hi)
             types = self.assign_types(rooms, pp["styles"][L], L)
             # room id raster
@@ -1825,7 +2154,7 @@ class _Builder:
                 if dtop + 1 <= top:
                     out.append(self.vox(rr, cc, dtop + 1, top + 1, np.tile(_rgb(C_PLASTER), (len(rr), 1)), MW))
             # stairs up from this level
-            for (sp, s_rr, s_cc, s_k) in (sdata if L < n - 1 else []):
+            for (sp, s_rr, s_cc, s_k, s_spine) in (sdata if L < n - 1 else []):
                 R = self.fy[L + 1] - self.fy[L]
                 kk = s_k
                 ytop = self.fy[L] + np.round(kk * R / sp["n"]).astype(np.int64)
@@ -1834,11 +2163,11 @@ class _Builder:
                     ybot = np.full(len(kk), self.fy[L] + 1, np.int64)
                 else:
                     thick = max(2, int(round(max(0.25, 2.0 * R / sp["n"] * vs) / vs)))
-                    # the flight below must keep head room (1.8 m) + one riser under this one: low storeys get thin treads
-                    head_rows = int(round(1.8 / vs))
-                    rise_rows = max(1, int(0.2 / vs + 1e-9))
+                    # the flight below must keep STAIR_HEAD of vertical head room above every tread (+1 row for the
+                    # rounding of the per-flight step heights): upper flights are thin zig-zag treads
+                    head_rows = int(math.ceil(STAIR_HEAD / vs - 1e-9)) + 1
                     r_min = min(self.fy[L] - self.fy[L - 1], R)
-                    thick = max(1, min(thick, r_min - head_rows - rise_rows))
+                    thick = max(1, min(thick, r_min - head_rows))
                     ybot = np.maximum(self.fy[L] + 1, ytop - thick + 1)
                 cnt = ytop - ybot + 1
                 rep_ = np.repeat(np.arange(len(kk)), cnt)
@@ -1848,8 +2177,13 @@ class _Builder:
                 col = np.where(is_top[:, None], _rgb(C_STAIR)[None, :], _rgb(C_STAIR_SIDE)[None, :])
                 out.append([(self.x0 + s_cc[rep_]).astype(np.int32), yy.astype(np.int32),
                             (self.z0 + s_rr[rep_]).astype(np.int32), self.pk(col, MW)])
+                # U stairs: a thin wall between the two lanes (storey high) so nobody stands on the rim of the other
+                # lane's treads (they differ by up to a storey) and the walker cannot clip the jagged edge
+                if len(s_spine[0]):
+                    sr_, sc_ = s_spine
+                    out.append(self.vox(sr_, sc_, lo, top_ + 1, np.tile(_rgb(C_STAIR_SIDE), (len(sr_), 1)), MW))
             # fixtures
-            if self.simp < 1:
+            if self.simp < 1 and not self.no_fix:
                 try:
                     out += self.fixtures(pp, g, rooms, types, L, rid, zone)
                 except _GEOS_ERR as e:       # degenerate geometry: this storey stays unfurnished, the interior survives
@@ -2099,15 +2433,15 @@ class _Builder:
         return keys
 
     def _separates(self, free, obst, keys) -> int:
-        """number of walkable components (passages >= 0.24 m wide, props keep 0.3 m clearance) that hold the keys;
+        """number of walkable components (passages >= 0.6 m wide, props keep 0.3 m clearance) that hold the keys;
         a large number if a key is walled in."""
         walk = free.difference(unary_union([o.buffer(0.3) for o in obst])) if obst else free
-        walk = walk.buffer(-0.12, join_style=2, mitre_limit=2.0)
+        walk = walk.buffer(-0.3, join_style=2, mitre_limit=2.0)       # passages >= 0.6 m: the client is a 0.6 m disc
         comps = _polys(walk)
         ids = set()
         for p in keys:
             pt = Point(p)
-            hit = [i for i, c in enumerate(comps) if c.distance(pt) <= 0.13]
+            hit = [i for i, c in enumerate(comps) if c.distance(pt) <= 0.3]
             if not hit:
                 return 99
             ids.add(hit[0])
@@ -2294,10 +2628,42 @@ class _Builder:
         return rr + r0, cc + c0
 
 
+def doorway_mask(X, Y, Z, ent: dict, grid, avoid=None) -> np.ndarray:
+    """bool mask of the voxels (grid indices X, Y, Z) that fill the doorway of one ``entrances_raw`` record: the lane
+    ``widthM`` wide along the door line from the outside point to the inside point, from the feet row up to 2.0 m.
+    Removing them leaves a walkable opening (floor / ground untouched, wall above 2.0 m stays as the lintel).
+    ``avoid``: geometry (UTM) of other parts / neighbours whose voxels must not be removed."""
+    vs = grid.vs
+    y0 = int(round(ent["inside"][1] / vs))
+    hr = int(math.ceil(2.0 / vs - 1e-9))
+    X, Y, Z = np.asarray(X), np.asarray(Y), np.asarray(Z)
+    m = (Y >= y0) & (Y < y0 + hr)
+    E = grid.e0 + (X + 0.5) * vs - ent["pt"][0]
+    N = grid.n0 - (Z + 0.5) * vs - ent["pt"][1]
+    al = E * ent["tan"][0] + N * ent["tan"][1]
+    de = E * ent["n_in"][0] + N * ent["n_in"][1]
+    h = 0.5 * ent["widthM"] + 0.5 * vs
+    m &= (np.abs(al) <= h) & (de >= -ent["dOut"] - 0.5 * vs - DOOR_APPROACH) & (de <= ent["dIn"] + 0.5 * vs)
+    if avoid is not None and m.any():       # voxels inside the footprint of another part / neighbour stay
+        idx = np.nonzero(m)[0]
+        inside = shapely.contains_xy(avoid, E[idx] + ent["pt"][0], N[idx] + ent["pt"][1])
+        m[idx[inside]] = False
+    return m
+
+
+def stair_lane_w(vs: float) -> float:
+    """Stair lane width (m): >= 1.0 m, and wide enough that after the 1-cell wall on each side the free lane still
+    holds a 0.6 m body with a cell of slack at any voxel size (0.6 + 3 cells)."""
+    return round(max(STAIR_W, 0.6 + 3.0 * vs), 2)
+
+
 def min_storey_rows(vs: float) -> int:
-    """Smallest storey height (rows) the interior builds: slab + 1.9 m clear, and never below 2.1 m."""
+    """Smallest storey height (rows) the interior builds: slab + 1.9 m clear, never below 2.1 m, and (multi-storey
+    buildings have stairs whose flights stack one storey apart) STAIR_HEAD of vertical head room above every tread
+    plus one 1-row thin tread and one row of rounding slack, i.e. about 2.7 m."""
     st = max(1, int(round(SLAB_T / vs)))
-    return max(st + max(4, int(round(1.9 / vs))), int(math.floor(2.1 / vs + 1e-9)))
+    stair = int(math.ceil(STAIR_HEAD / vs - 1e-9)) + 2
+    return max(st + max(4, int(round(1.9 / vs))), int(math.floor(2.1 / vs + 1e-9)), stair)
 
 
 def _principal_angle(poly) -> float:
